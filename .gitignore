@@ -1,0 +1,40 @@
+# Binaries
+/bin/
+/dist/
+/raftkvd
+/raftkvctl
+*.exe
+*.test
+*.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# Data / runtime
+*.data
+*.db
+data/
+*.snap
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Worktrees
+.worktrees/
+worktrees/
+
+# Tooling
+.golangci-lint-cache/
+vendor/
+
+# Private working notes (roadmap, interview prep) — not for public consumption
+PLAN.md
+docs/
+*.plan.md
+NOTES.md
+TODO.md
