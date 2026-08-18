@@ -34,12 +34,16 @@ type Node struct {
 
 	rng              *rand.Rand
 	electionDeadline time.Time
+	lastHeartbeat    time.Time
+	votes            map[NodeID]struct{}
 
 	rpcMu         sync.Mutex
 	requestVotes  int
 	appendEntries int
 	installSnaps  int
 
+	ctx       context.Context
+	cancel    context.CancelFunc
 	startOnce sync.Once
 	stopOnce  sync.Once
 	done      chan struct{}
@@ -81,8 +85,10 @@ func New(cfg Config, transport Transport, clock Clock, storage Storage, sm State
 		sm:         sm,
 		applyCh:    make(chan ApplyMsg, 64),
 		rng:        rand.New(rand.NewSource(cfg.RandSeed)),
+		votes:      make(map[NodeID]struct{}),
 		done:       make(chan struct{}),
 	}
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 
 	if hs, entries, err := storage.Load(); err == nil {
 		n.currentTerm = hs.CurrentTerm
@@ -112,6 +118,13 @@ func (n *Node) Term() uint64 {
 	return n.currentTerm
 }
 
+// RoleAndTerm returns role and term from one critical section.
+func (n *Node) RoleAndTerm() (Role, uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.role, n.currentTerm
+}
+
 // Start launches the ticker goroutine. It is a no-op if already started.
 func (n *Node) Start() {
 	n.startOnce.Do(func() {
@@ -123,6 +136,7 @@ func (n *Node) Start() {
 // Stop joins background goroutines. It is idempotent.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
+		n.cancel()
 		close(n.done)
 		n.wg.Wait()
 	})
@@ -144,9 +158,35 @@ func (n *Node) runTicker() {
 
 func (n *Node) onTick() {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	// Phase 1: election timeout is tracked but does not change role.
-	// Phase 2 will start an election when n.clock.Now().After(n.electionDeadline).
+	switch n.role {
+	case Leader:
+		due := n.clock.Now().Sub(n.lastHeartbeat) >= n.cfg.HeartbeatInterval
+		var args AppendEntriesArgs
+		var peers []NodeID
+		if due {
+			n.lastHeartbeat = n.clock.Now()
+			args = n.heartbeatArgsLocked()
+			peers = append([]NodeID(nil), n.peers...)
+		}
+		n.mu.Unlock()
+		if due {
+			n.broadcastHeartbeats(args, peers)
+		}
+		return
+	default:
+		if !n.clock.Now().After(n.electionDeadline) {
+			n.mu.Unlock()
+			return
+		}
+		rv, rvPeers, hb, hbPeers := n.startElectionLocked()
+		n.mu.Unlock()
+		if rv != nil {
+			n.broadcastRequestVotes(*rv, rvPeers)
+		}
+		if hb != nil {
+			n.broadcastHeartbeats(*hb, hbPeers)
+		}
+	}
 }
 
 func (n *Node) resetElectionDeadlineLocked() {
@@ -192,41 +232,79 @@ func (n *Node) RequestVoteCount() int {
 	return n.requestVotes
 }
 
-// RequestVote handles an incoming RequestVote RPC. Phase 1 only records it.
+// RequestVote handles an incoming RequestVote RPC.
 func (n *Node) RequestVote(_ context.Context, args *RequestVoteArgs) (*RequestVoteReply, error) {
 	n.rpcMu.Lock()
 	n.requestVotes++
 	n.rpcMu.Unlock()
 
 	n.mu.Lock()
-	term := n.currentTerm
-	n.mu.Unlock()
-	_ = args
-	return &RequestVoteReply{Term: term}, nil
+	defer n.mu.Unlock()
+
+	reply := &RequestVoteReply{Term: n.currentTerm}
+	if args.Term > n.currentTerm {
+		n.stepDownLocked(args.Term)
+		reply.Term = n.currentTerm
+	}
+	if args.Term < n.currentTerm {
+		return reply, nil
+	}
+	canVote := n.votedFor == nil || *n.votedFor == args.CandidateID
+	if canVote && n.logUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		cid := args.CandidateID
+		n.votedFor = &cid
+		n.persistLocked()
+		n.resetElectionDeadlineLocked()
+		reply.VoteGranted = true
+	}
+	reply.Term = n.currentTerm
+	return reply, nil
 }
 
-// AppendEntries handles an incoming AppendEntries RPC. Phase 1 only records it.
+// AppendEntries handles an incoming AppendEntries RPC (heartbeats in Phase 2).
 func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	n.rpcMu.Lock()
 	n.appendEntries++
 	n.rpcMu.Unlock()
 
 	n.mu.Lock()
-	term := n.currentTerm
-	n.mu.Unlock()
-	_ = args
-	return &AppendEntriesReply{Term: term}, nil
+	defer n.mu.Unlock()
+
+	reply := &AppendEntriesReply{Term: n.currentTerm}
+	if args.Term > n.currentTerm {
+		n.stepDownLocked(args.Term)
+		reply.Term = n.currentTerm
+	}
+	if args.Term < n.currentTerm {
+		// Stale leader: reject and do not reset the election timer.
+		return reply, nil
+	}
+	n.role = Follower
+	n.resetElectionDeadlineLocked()
+	reply.Success = true
+	reply.Term = n.currentTerm
+	return reply, nil
 }
 
-// InstallSnapshot handles an incoming InstallSnapshot RPC. Phase 1 only records it.
+// InstallSnapshot handles an incoming InstallSnapshot RPC. Phase 2 applies the term rule only.
 func (n *Node) InstallSnapshot(_ context.Context, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
 	n.rpcMu.Lock()
 	n.installSnaps++
 	n.rpcMu.Unlock()
 
 	n.mu.Lock()
-	term := n.currentTerm
-	n.mu.Unlock()
-	_ = args
-	return &InstallSnapshotReply{Term: term}, nil
+	defer n.mu.Unlock()
+
+	reply := &InstallSnapshotReply{Term: n.currentTerm}
+	if args.Term > n.currentTerm {
+		n.stepDownLocked(args.Term)
+		reply.Term = n.currentTerm
+	}
+	if args.Term < n.currentTerm {
+		return reply, nil
+	}
+	n.role = Follower
+	n.resetElectionDeadlineLocked()
+	reply.Term = n.currentTerm
+	return reply, nil
 }

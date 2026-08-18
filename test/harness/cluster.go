@@ -16,6 +16,8 @@ type Cluster struct {
 	net      *memory.Network
 	nodes    map[raft.NodeID]*raft.Node
 	storage  map[raft.NodeID]raft.Storage
+	isolated map[raft.NodeID]bool
+	seenLead map[uint64]raft.NodeID
 	shutdown bool
 }
 
@@ -26,11 +28,13 @@ func NewCluster(t *testing.T, n int) *Cluster {
 		t.Fatalf("NewCluster: n must be > 0")
 	}
 	c := &Cluster{
-		t:       t,
-		n:       n,
-		net:     memory.New(1),
-		nodes:   make(map[raft.NodeID]*raft.Node, n),
-		storage: make(map[raft.NodeID]raft.Storage, n),
+		t:        t,
+		n:        n,
+		net:      memory.New(1),
+		nodes:    make(map[raft.NodeID]*raft.Node, n),
+		storage:  make(map[raft.NodeID]raft.Storage, n),
+		isolated: make(map[raft.NodeID]bool, n),
+		seenLead: make(map[uint64]raft.NodeID),
 	}
 	peers := make([]raft.NodeID, 0, n)
 	for i := 1; i <= n; i++ {
@@ -82,10 +86,16 @@ func (c *Cluster) Transport(from raft.NodeID) raft.Transport {
 func (c *Cluster) SetDropRate(p float64) { c.net.SetDropRate(p) }
 
 // Disconnect isolates id from every other node.
-func (c *Cluster) Disconnect(id raft.NodeID) { c.net.Isolate(id) }
+func (c *Cluster) Disconnect(id raft.NodeID) {
+	c.isolated[id] = true
+	c.net.Isolate(id)
+}
 
 // Reconnect restores connectivity for id.
-func (c *Cluster) Reconnect(id raft.NodeID) { c.net.Unisolate(id) }
+func (c *Cluster) Reconnect(id raft.NodeID) {
+	delete(c.isolated, id)
+	c.net.Unisolate(id)
+}
 
 // Crash stops id and unregisters it from the network, keeping its storage.
 func (c *Cluster) Crash(id raft.NodeID) {
@@ -96,6 +106,7 @@ func (c *Cluster) Crash(id raft.NodeID) {
 	}
 	n.Stop()
 	c.net.Unregister(id)
+	c.isolated[id] = true
 	c.nodes[id] = nil
 }
 
@@ -116,6 +127,7 @@ func (c *Cluster) Restart(id raft.NodeID) {
 	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, c.storage[id], raft.NoopStateMachine{})
 	c.net.Register(id, node)
 	c.nodes[id] = node
+	delete(c.isolated, id)
 	node.Start()
 }
 
@@ -126,14 +138,24 @@ func (c *Cluster) SendRequestVote(from, to raft.NodeID, args *raft.RequestVoteAr
 	return c.net.Transport(from).SendRequestVote(ctx, to, args)
 }
 
-// CheckOneLeader fails the test unless exactly one live node is Leader.
+func (c *Cluster) connected(id raft.NodeID) bool {
+	n, ok := c.nodes[id]
+	return ok && n != nil && !c.isolated[id]
+}
+
+// CheckOneLeader fails unless exactly one connected node is Leader.
 func (c *Cluster) CheckOneLeader() raft.NodeID {
 	c.t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
+		c.CheckElectionSafety()
 		var leaders []raft.NodeID
-		for id, n := range c.nodes {
-			if n != nil && n.Role() == raft.Leader {
+		for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
+			if !c.connected(id) {
+				continue
+			}
+			role, _ := c.nodes[id].RoleAndTerm()
+			if role == raft.Leader {
 				leaders = append(leaders, id)
 			}
 		}
@@ -142,8 +164,53 @@ func (c *Cluster) CheckOneLeader() raft.NodeID {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	c.t.Fatalf("wanted exactly one leader")
+	c.t.Fatalf("wanted exactly one connected leader")
 	return 0
+}
+
+// CheckNoLeader waits window and fails if a connected node is Leader.
+func (c *Cluster) CheckNoLeader(window time.Duration) {
+	c.t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		c.CheckElectionSafety()
+		for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
+			if !c.connected(id) {
+				continue
+			}
+			role, _ := c.nodes[id].RoleAndTerm()
+			if role == raft.Leader {
+				c.t.Fatalf("node %d is leader without quorum", id)
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// CheckElectionSafety fails if two live nodes are leaders in the same term.
+func (c *Cluster) CheckElectionSafety() {
+	c.t.Helper()
+	byTerm := make(map[uint64][]raft.NodeID)
+	for id, n := range c.nodes {
+		if n == nil {
+			continue
+		}
+		role, term := n.RoleAndTerm()
+		if role != raft.Leader {
+			continue
+		}
+		byTerm[term] = append(byTerm[term], id)
+	}
+	for term, ids := range byTerm {
+		if len(ids) > 1 {
+			c.t.Fatalf("election safety: leaders %v share term %d", ids, term)
+		}
+		id := ids[0]
+		if prev, ok := c.seenLead[term]; ok && prev != id {
+			c.t.Fatalf("election safety: term %d had leader %d, now %d", term, prev, id)
+		}
+		c.seenLead[term] = id
+	}
 }
 
 // CheckTerms fails if two live nodes disagree on currentTerm.
