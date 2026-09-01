@@ -38,20 +38,7 @@ func (n *Node) logUpToDateLocked(lastLogIndex, lastLogTerm uint64) bool {
 	return lastLogIndex >= myIndex
 }
 
-func (n *Node) heartbeatArgsLocked() AppendEntriesArgs {
-	prevIndex := n.lastIndex()
-	prevTerm, _ := n.termAt(prevIndex)
-	return AppendEntriesArgs{
-		Term:         n.currentTerm,
-		LeaderID:     n.id,
-		PrevLogIndex: prevIndex,
-		PrevLogTerm:  prevTerm,
-		Entries:      nil,
-		LeaderCommit: n.commitIndex,
-	}
-}
-
-func (n *Node) startElectionLocked() (rv *RequestVoteArgs, rvPeers []NodeID, hb *AppendEntriesArgs, hbPeers []NodeID) {
+func (n *Node) startElectionLocked() (rv *RequestVoteArgs, rvPeers []NodeID, becameLeader bool) {
 	n.currentTerm++
 	n.role = Candidate
 	self := n.id
@@ -70,20 +57,19 @@ func (n *Node) startElectionLocked() (rv *RequestVoteArgs, rvPeers []NodeID, hb 
 	}
 	peers := append([]NodeID(nil), n.peers...)
 	if n.hasMajorityLocked() {
-		h, hp := n.becomeLeaderLocked()
-		return nil, nil, &h, hp
+		n.becomeLeaderLocked()
+		return nil, nil, true
 	}
-	return &args, peers, nil, nil
+	return &args, peers, false
 }
 
-func (n *Node) becomeLeaderLocked() (AppendEntriesArgs, []NodeID) {
+func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
 	n.lastHeartbeat = n.clock.Now()
 	for _, p := range n.peers {
 		n.nextIndex[p] = n.lastIndex() + 1
 		n.matchIndex[p] = 0
 	}
-	return n.heartbeatArgsLocked(), append([]NodeID(nil), n.peers...)
 }
 
 func (n *Node) broadcastRequestVotes(args RequestVoteArgs, peers []NodeID) {
@@ -104,8 +90,7 @@ func (n *Node) broadcastRequestVotes(args RequestVoteArgs, peers []NodeID) {
 }
 
 func (n *Node) handleRequestVoteReply(from NodeID, sentTerm uint64, reply *RequestVoteReply) {
-	var hb *AppendEntriesArgs
-	var peers []NodeID
+	var becameLeader bool
 	n.mu.Lock()
 	if reply.Term > n.currentTerm {
 		n.stepDownLocked(reply.Term)
@@ -119,39 +104,12 @@ func (n *Node) handleRequestVoteReply(from NodeID, sentTerm uint64, reply *Reque
 	if reply.VoteGranted {
 		n.votes[from] = struct{}{}
 		if n.hasMajorityLocked() {
-			args, p := n.becomeLeaderLocked()
-			hb, peers = &args, p
+			n.becomeLeaderLocked()
+			becameLeader = true
 		}
 	}
 	n.mu.Unlock()
-	if hb != nil {
-		n.broadcastHeartbeats(*hb, peers)
+	if becameLeader {
+		n.replicateAll()
 	}
-}
-
-func (n *Node) broadcastHeartbeats(args AppendEntriesArgs, peers []NodeID) {
-	for _, to := range peers {
-		to := to
-		n.wg.Add(1)
-		go func() {
-			defer n.wg.Done()
-			ctx, cancel := context.WithTimeout(n.ctx, 80*time.Millisecond)
-			defer cancel()
-			reply, err := n.transport.SendAppendEntries(ctx, to, &args)
-			if err != nil {
-				return
-			}
-			n.handleAppendEntriesReply(args.Term, reply)
-		}()
-	}
-}
-
-func (n *Node) handleAppendEntriesReply(sentTerm uint64, reply *AppendEntriesReply) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if reply.Term > n.currentTerm {
-		n.stepDownLocked(reply.Term)
-		return
-	}
-	_ = sentTerm
 }

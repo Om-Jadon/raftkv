@@ -31,6 +31,7 @@ type Node struct {
 	storage   Storage
 	sm        StateMachine
 	applyCh   chan ApplyMsg
+	applyWake chan struct{}
 
 	rng              *rand.Rand
 	electionDeadline time.Time
@@ -125,10 +126,26 @@ func (n *Node) RoleAndTerm() (Role, uint64) {
 	return n.role, n.currentTerm
 }
 
-// Start launches the ticker goroutine. It is a no-op if already started.
-func (n *Node) Start() {
+// CommitIndex returns the highest known committed log index.
+func (n *Node) CommitIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.commitIndex
+}
+
+// LastApplied returns the highest log index applied to the state machine.
+func (n *Node) LastApplied() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastApplied
+}
+
+// Run launches background goroutines. It is a no-op if already started.
+func (n *Node) Run() {
 	n.startOnce.Do(func() {
-		n.wg.Add(1)
+		n.applyWake = make(chan struct{}, 1)
+		n.wg.Add(2)
+		go n.runApplier()
 		go n.runTicker()
 	})
 }
@@ -161,16 +178,12 @@ func (n *Node) onTick() {
 	switch n.role {
 	case Leader:
 		due := n.clock.Now().Sub(n.lastHeartbeat) >= n.cfg.HeartbeatInterval
-		var args AppendEntriesArgs
-		var peers []NodeID
 		if due {
 			n.lastHeartbeat = n.clock.Now()
-			args = n.heartbeatArgsLocked()
-			peers = append([]NodeID(nil), n.peers...)
 		}
 		n.mu.Unlock()
 		if due {
-			n.broadcastHeartbeats(args, peers)
+			n.replicateAll()
 		}
 		return
 	default:
@@ -178,13 +191,13 @@ func (n *Node) onTick() {
 			n.mu.Unlock()
 			return
 		}
-		rv, rvPeers, hb, hbPeers := n.startElectionLocked()
+		rv, rvPeers, becameLeader := n.startElectionLocked()
 		n.mu.Unlock()
 		if rv != nil {
 			n.broadcastRequestVotes(*rv, rvPeers)
 		}
-		if hb != nil {
-			n.broadcastHeartbeats(*hb, hbPeers)
+		if becameLeader {
+			n.replicateAll()
 		}
 	}
 }
@@ -261,7 +274,7 @@ func (n *Node) RequestVote(_ context.Context, args *RequestVoteArgs) (*RequestVo
 	return reply, nil
 }
 
-// AppendEntries handles an incoming AppendEntries RPC (heartbeats in Phase 2).
+// AppendEntries handles an incoming AppendEntries RPC.
 func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
 	n.rpcMu.Lock()
 	n.appendEntries++
@@ -276,14 +289,84 @@ func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*Appen
 		reply.Term = n.currentTerm
 	}
 	if args.Term < n.currentTerm {
-		// Stale leader: reject and do not reset the election timer.
 		return reply, nil
 	}
 	n.role = Follower
 	n.resetElectionDeadlineLocked()
+
+	if args.PrevLogIndex > n.lastIndex() {
+		reply.ConflictIndex = n.lastIndex() + 1
+		reply.Term = n.currentTerm
+		return reply, nil
+	}
+	if args.PrevLogIndex > 0 {
+		prevTerm, ok := n.termAt(args.PrevLogIndex)
+		if !ok || prevTerm != args.PrevLogTerm {
+			if ok {
+				reply.ConflictTerm = prevTerm
+				reply.ConflictIndex = n.firstIndexOfTermLocked(prevTerm)
+			} else {
+				reply.ConflictIndex = n.firstIndex()
+			}
+			reply.Term = n.currentTerm
+			return reply, nil
+		}
+	}
+
+	insertAt := args.PrevLogIndex + 1
+	for i, ent := range args.Entries {
+		idx := insertAt + uint64(i)
+		if idx <= n.lastIndex() {
+			existingTerm, _ := n.termAt(idx)
+			if existingTerm != ent.Term {
+				n.truncateLogLocked(idx)
+				toAppend := make([]LogEntry, len(args.Entries[i:]))
+				for j, e := range args.Entries[i:] {
+					toAppend[j] = LogEntry{
+						Term:    e.Term,
+						Index:   e.Index,
+						Command: append([]byte(nil), e.Command...),
+					}
+				}
+				n.appendLogLocked(toAppend)
+				break
+			}
+			continue
+		}
+		toAppend := make([]LogEntry, len(args.Entries[i:]))
+		for j, e := range args.Entries[i:] {
+			toAppend[j] = LogEntry{
+				Term:    e.Term,
+				Index:   e.Index,
+				Command: append([]byte(nil), e.Command...),
+			}
+		}
+		n.appendLogLocked(toAppend)
+		break
+	}
+
+	if args.LeaderCommit > n.commitIndex {
+		lastNew := n.lastIndex()
+		commitTo := args.LeaderCommit
+		if commitTo > lastNew {
+			commitTo = lastNew
+		}
+		n.bumpCommitLocked(commitTo)
+	}
+
 	reply.Success = true
 	reply.Term = n.currentTerm
 	return reply, nil
+}
+
+func (n *Node) firstIndexOfTermLocked(term uint64) uint64 {
+	for i := n.firstIndex(); i <= n.lastIndex(); i++ {
+		t, ok := n.termAt(i)
+		if ok && t == term {
+			return i
+		}
+	}
+	return n.firstIndex()
 }
 
 // InstallSnapshot handles an incoming InstallSnapshot RPC. Phase 2 applies the term rule only.

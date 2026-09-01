@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,11 +12,13 @@ import (
 
 // Cluster is an in-process group of Raft nodes sharing a memory network.
 type Cluster struct {
+	mu       sync.Mutex
 	t        *testing.T
 	n        int
 	net      *memory.Network
 	nodes    map[raft.NodeID]*raft.Node
 	storage  map[raft.NodeID]raft.Storage
+	sms      map[raft.NodeID]*RecordSM
 	isolated map[raft.NodeID]bool
 	seenLead map[uint64]raft.NodeID
 	shutdown bool
@@ -33,6 +36,7 @@ func NewCluster(t *testing.T, n int) *Cluster {
 		net:      memory.New(1),
 		nodes:    make(map[raft.NodeID]*raft.Node, n),
 		storage:  make(map[raft.NodeID]raft.Storage, n),
+		sms:      make(map[raft.NodeID]*RecordSM, n),
 		isolated: make(map[raft.NodeID]bool, n),
 		seenLead: make(map[uint64]raft.NodeID),
 	}
@@ -44,11 +48,13 @@ func NewCluster(t *testing.T, n int) *Cluster {
 		id := raft.NodeID(i)
 		cfg := raft.DefaultConfig(id, others(peers, id))
 		st := raft.NewMemoryStorage()
-		node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, raft.NoopStateMachine{})
+		sm := &RecordSM{}
+		node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
 		c.net.Register(id, node)
 		c.nodes[id] = node
 		c.storage[id] = st
-		node.Start()
+		c.sms[id] = sm
+		node.Run()
 	}
 	t.Cleanup(c.Shutdown)
 	return c
@@ -124,11 +130,17 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		}
 	}
 	cfg := raft.DefaultConfig(id, peers)
-	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, c.storage[id], raft.NoopStateMachine{})
+	sm := c.sms[id]
+	if sm == nil {
+		sm = &RecordSM{}
+		c.sms[id] = sm
+	}
+	sm.Reset()
+	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, c.storage[id], sm)
 	c.net.Register(id, node)
 	c.nodes[id] = node
 	delete(c.isolated, id)
-	node.Start()
+	node.Run()
 }
 
 // SendRequestVote sends a RequestVote RPC from one cluster node to another.
@@ -190,6 +202,8 @@ func (c *Cluster) CheckNoLeader(window time.Duration) {
 // CheckElectionSafety fails if two live nodes are leaders in the same term.
 func (c *Cluster) CheckElectionSafety() {
 	c.t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	byTerm := make(map[uint64][]raft.NodeID)
 	for id, n := range c.nodes {
 		if n == nil {

@@ -25,7 +25,7 @@ func (stubTransport) SendInstallSnapshot(context.Context, NodeID, *InstallSnapsh
 
 func TestStopIdempotentNoLeak(t *testing.T) {
 	n := New(DefaultConfig(1, nil), stubTransport{}, RealClock{}, NewMemoryStorage(), NoopStateMachine{})
-	n.Start()
+	n.Run()
 	n.Stop()
 	n.Stop()
 	if n.Role() != Follower {
