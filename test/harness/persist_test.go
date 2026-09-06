@@ -178,7 +178,8 @@ func TestUnreliableChurn(t *testing.T) {
 				for time.Now().Before(wait) {
 					count := 0
 					for id := raft.NodeID(1); id <= 5; id++ {
-						if c.nodes[id] != nil && c.Node(id).CommitIndex() >= index {
+						n := c.TryNode(id)
+						if n != nil && n.CommitIndex() >= index {
 							count++
 						}
 					}
@@ -191,7 +192,7 @@ func TestUnreliableChurn(t *testing.T) {
 			}
 		case 3:
 			id := raft.NodeID(rng.Intn(5) + 1)
-			if c.nodes[id] != nil {
+			if c.TryNode(id) != nil {
 				c.Crash(id)
 				time.Sleep(20 * time.Millisecond)
 				c.Restart(id)
@@ -211,7 +212,7 @@ func TestUnreliableChurn(t *testing.T) {
 
 	// Stabilize.
 	for id := raft.NodeID(1); id <= 5; id++ {
-		if c.nodes[id] == nil {
+		if c.TryNode(id) == nil {
 			c.Restart(id)
 		}
 		c.Reconnect(id)

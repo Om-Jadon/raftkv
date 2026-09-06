@@ -15,26 +15,28 @@ import (
 
 // Cluster is an in-process group of Raft nodes sharing a memory network.
 type Cluster struct {
-	mu        sync.Mutex
-	t         *testing.T
-	n         int
-	net       *memory.Network
-	nodes     map[raft.NodeID]*raft.Node
-	storage   map[raft.NodeID]raft.Storage
-	dataDirs  map[raft.NodeID]string
-	sms       map[raft.NodeID]*RecordSM
-	isolated  map[raft.NodeID]bool
-	seenLead  map[uint64]raft.NodeID
-	shutdown  bool
-	persist   bool
-	rootDir   string
-	newSM     func(raft.NodeID) raft.StateMachine
+	mu       sync.Mutex
+	t        *testing.T
+	n        int
+	net      *memory.Network
+	nodes    map[raft.NodeID]*raft.Node
+	storage  map[raft.NodeID]raft.Storage
+	dataDirs map[raft.NodeID]string
+	sms      map[raft.NodeID]*RecordSM
+	isolated map[raft.NodeID]bool
+	seenLead map[uint64]raft.NodeID
+	shutdown bool
+	persist  bool
+	rootDir  string
+	newSM    func(raft.NodeID) raft.StateMachine
 }
 
 // ClusterOptions customizes cluster construction.
 type ClusterOptions struct {
 	Persist bool
 	NewSM   func(raft.NodeID) raft.StateMachine
+	// Seed drives the fake network's drop/delay/dup RNG. Zero means 1.
+	Seed int64
 }
 
 // NewCluster starts n Followers with IDs 1..n, fully connected (in-memory storage).
@@ -53,10 +55,14 @@ func NewClusterWith(t *testing.T, n int, opts ClusterOptions) *Cluster {
 	if n <= 0 {
 		t.Fatalf("NewCluster: n must be > 0")
 	}
+	netSeed := opts.Seed
+	if netSeed == 0 {
+		netSeed = 1
+	}
 	c := &Cluster{
 		t:        t,
 		n:        n,
-		net:      memory.New(1),
+		net:      memory.New(netSeed),
 		nodes:    make(map[raft.NodeID]*raft.Node, n),
 		storage:  make(map[raft.NodeID]raft.Storage, n),
 		dataDirs: make(map[raft.NodeID]string, n),
@@ -140,6 +146,8 @@ func (c *Cluster) Node(id raft.NodeID) *raft.Node {
 
 // TryNode returns the live node or nil if it is crashed.
 func (c *Cluster) TryNode(id raft.NodeID) *raft.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	n, ok := c.nodes[id]
 	if !ok {
 		return nil
@@ -157,32 +165,44 @@ func (c *Cluster) SetDropRate(p float64) { c.net.SetDropRate(p) }
 
 // Disconnect isolates id from every other node.
 func (c *Cluster) Disconnect(id raft.NodeID) {
+	c.mu.Lock()
 	c.isolated[id] = true
+	c.mu.Unlock()
 	c.net.Isolate(id)
 }
 
 // Reconnect restores connectivity for id.
 func (c *Cluster) Reconnect(id raft.NodeID) {
+	c.mu.Lock()
 	delete(c.isolated, id)
+	c.mu.Unlock()
 	c.net.Unisolate(id)
 }
 
 // Crash stops id and unregisters it from the network, keeping its storage.
 func (c *Cluster) Crash(id raft.NodeID) {
 	c.t.Helper()
+	c.mu.Lock()
 	n, ok := c.nodes[id]
 	if !ok || n == nil {
+		c.mu.Unlock()
 		return
 	}
+	c.nodes[id] = nil
+	c.isolated[id] = true
+	persist := c.persist
+	st := c.storage[id]
+	if persist {
+		c.storage[id] = nil
+	}
+	c.mu.Unlock()
+
 	n.Stop()
 	c.net.Unregister(id)
-	c.isolated[id] = true
-	c.nodes[id] = nil
-	if c.persist {
-		if fs, ok := c.storage[id].(*storage.FileStorage); ok {
+	if persist {
+		if fs, ok := st.(*storage.FileStorage); ok {
 			_ = fs.Close()
 		}
-		c.storage[id] = nil
 	}
 }
 
@@ -190,7 +210,7 @@ func (c *Cluster) Crash(id raft.NodeID) {
 // Volatile state (commitIndex, lastApplied, role) starts from zero and is rebuilt by replication.
 func (c *Cluster) Restart(id raft.NodeID) {
 	c.t.Helper()
-	if live, ok := c.nodes[id]; ok && live != nil {
+	if live := c.TryNode(id); live != nil {
 		c.Crash(id)
 	}
 	peers := make([]raft.NodeID, 0, c.n-1)
@@ -201,23 +221,35 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		}
 	}
 	cfg := raft.DefaultConfig(id, peers)
+
+	c.mu.Lock()
 	sm := c.makeSM(id)
 	st := c.storage[id]
+	persist := c.persist
+	dataDir := c.dataDirs[id]
+	c.mu.Unlock()
+
 	if st == nil {
 		st = c.openStorage(id, &cfg)
+		c.mu.Lock()
 		c.storage[id] = st
-	} else if c.persist {
-		cfg.DataDir = c.dataDirs[id]
+		c.mu.Unlock()
+	} else if persist {
+		cfg.DataDir = dataDir
 	}
 	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
 	c.net.Register(id, node)
+	c.mu.Lock()
 	c.nodes[id] = node
 	delete(c.isolated, id)
+	c.mu.Unlock()
 	node.Run()
 }
 
 // Storage returns the Storage for id (may be nil while crashed in persistent mode).
 func (c *Cluster) Storage(id raft.NodeID) raft.Storage {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.storage[id]
 }
 
@@ -234,6 +266,8 @@ func (c *Cluster) SendRequestVote(from, to raft.NodeID, args *raft.RequestVoteAr
 }
 
 func (c *Cluster) connected(id raft.NodeID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	n, ok := c.nodes[id]
 	return ok && n != nil && !c.isolated[id]
 }
@@ -246,10 +280,11 @@ func (c *Cluster) CheckOneLeader() raft.NodeID {
 		c.CheckElectionSafety()
 		var leaders []raft.NodeID
 		for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
-			if !c.connected(id) {
+			n := c.TryNode(id)
+			if n == nil || !c.connected(id) {
 				continue
 			}
-			role, _ := c.nodes[id].RoleAndTerm()
+			role, _ := n.RoleAndTerm()
 			if role == raft.Leader {
 				leaders = append(leaders, id)
 			}
@@ -273,7 +308,11 @@ func (c *Cluster) CheckNoLeader(window time.Duration) {
 			if !c.connected(id) {
 				continue
 			}
-			role, _ := c.nodes[id].RoleAndTerm()
+			n := c.TryNode(id)
+			if n == nil {
+				continue
+			}
+			role, _ := n.RoleAndTerm()
 			if role == raft.Leader {
 				c.t.Fatalf("node %d is leader without quorum", id)
 			}
@@ -285,18 +324,34 @@ func (c *Cluster) CheckNoLeader(window time.Duration) {
 // CheckElectionSafety fails if two live nodes are leaders in the same term.
 func (c *Cluster) CheckElectionSafety() {
 	c.t.Helper()
+	type lead struct {
+		id   raft.NodeID
+		term uint64
+	}
+	c.mu.Lock()
+	nodes := make([]*raft.Node, 0, c.n)
+	ids := make([]raft.NodeID, 0, c.n)
+	for id, n := range c.nodes {
+		if n != nil {
+			ids = append(ids, id)
+			nodes = append(nodes, n)
+		}
+	}
+	c.mu.Unlock()
+
+	var leaders []lead
+	for i, n := range nodes {
+		role, term := n.RoleAndTerm()
+		if role == raft.Leader {
+			leaders = append(leaders, lead{id: ids[i], term: term})
+		}
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	byTerm := make(map[uint64][]raft.NodeID)
-	for id, n := range c.nodes {
-		if n == nil {
-			continue
-		}
-		role, term := n.RoleAndTerm()
-		if role != raft.Leader {
-			continue
-		}
-		byTerm[term] = append(byTerm[term], id)
+	for _, l := range leaders {
+		byTerm[l.term] = append(byTerm[l.term], l.id)
 	}
 	for term, ids := range byTerm {
 		if len(ids) > 1 {
@@ -315,10 +370,7 @@ func (c *Cluster) CheckTerms() uint64 {
 	c.t.Helper()
 	var term uint64
 	var seen bool
-	for _, n := range c.nodes {
-		if n == nil {
-			continue
-		}
+	for _, n := range c.liveNodes() {
 		t := n.Term()
 		if !seen {
 			term = t
@@ -334,23 +386,78 @@ func (c *Cluster) CheckTerms() uint64 {
 
 // Shutdown stops every node and closes the fake network. It is idempotent.
 func (c *Cluster) Shutdown() {
+	c.mu.Lock()
 	if c.shutdown {
+		c.mu.Unlock()
 		return
 	}
 	c.shutdown = true
+	nodes := make([]*raft.Node, 0, len(c.nodes))
 	for id, n := range c.nodes {
 		if n != nil {
-			n.Stop()
+			nodes = append(nodes, n)
 			c.nodes[id] = nil
 		}
 	}
+	storages := make([]raft.Storage, 0, len(c.storage))
 	if c.persist {
 		for id, st := range c.storage {
-			if fs, ok := st.(*storage.FileStorage); ok {
-				_ = fs.Close()
+			if st != nil {
+				storages = append(storages, st)
 			}
 			c.storage[id] = nil
 		}
 	}
-	c.net.Close()
+	net := c.net
+	c.mu.Unlock()
+
+	for _, n := range nodes {
+		n.Stop()
+	}
+	if c.persist {
+		for _, st := range storages {
+			if fs, ok := st.(*storage.FileStorage); ok {
+				_ = fs.Close()
+			}
+		}
+	}
+	net.Close()
+}
+
+func (c *Cluster) liveNodes() []*raft.Node {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*raft.Node, 0, c.n)
+	for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
+		if n := c.nodes[id]; n != nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// DebugStates returns a lock-safe snapshot of every live node.
+func (c *Cluster) DebugStates() []raft.DebugState {
+	nodes := c.liveNodes()
+	out := make([]raft.DebugState, 0, len(nodes))
+	for _, n := range nodes {
+		out = append(out, n.DebugState())
+	}
+	return out
+}
+
+// Network returns the fake network (for chaos fault injection).
+func (c *Cluster) Network() *memory.Network { return c.net }
+
+// Heal reconnects every node, restarts crashed ones, and clears network faults.
+func (c *Cluster) Heal() {
+	c.t.Helper()
+	c.net.ClearFaults()
+	for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
+		if c.TryNode(id) == nil {
+			c.Restart(id)
+			continue
+		}
+		c.Reconnect(id)
+	}
 }

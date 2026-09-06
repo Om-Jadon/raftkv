@@ -6,7 +6,11 @@ import (
 )
 
 func (n *Node) persistLocked() {
-	if err := n.storage.SaveHardState(n.currentTerm, n.votedFor); err != nil {
+	vf := n.votedFor
+	if SkipVotePersist.Load() {
+		vf = nil
+	}
+	if err := n.storage.SaveHardState(n.currentTerm, vf); err != nil {
 		panic(err)
 	}
 }

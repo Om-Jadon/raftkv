@@ -28,7 +28,11 @@ type Network struct {
 	servers  map[raft.NodeID]raft.RPCHandler
 	dropRate float64
 	delay    time.Duration
+	delayMax time.Duration
+	dupRate  float64
 	isolated map[raft.NodeID]struct{}
+	blocked  map[raft.NodeID]map[raft.NodeID]struct{}
+	hook     func(kind string, from, to raft.NodeID, err error)
 	closed   bool
 	wg       sync.WaitGroup
 }
@@ -39,6 +43,7 @@ func New(seed int64) *Network {
 		rng:      rand.New(rand.NewSource(seed)),
 		servers:  make(map[raft.NodeID]raft.RPCHandler),
 		isolated: make(map[raft.NodeID]struct{}),
+		blocked:  make(map[raft.NodeID]map[raft.NodeID]struct{}),
 	}
 }
 
@@ -73,6 +78,29 @@ func (n *Network) SetDelay(d time.Duration) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.delay = d
+	n.delayMax = 0
+}
+
+// SetDelayRange sets a random per-RPC delay in [0, max]. Reorders naturally.
+func (n *Network) SetDelayRange(max time.Duration) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.delay = 0
+	n.delayMax = max
+}
+
+// SetDupRate is the probability that a delivered RPC is sent twice.
+func (n *Network) SetDupRate(p float64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dupRate = p
+}
+
+// SetHook is called for every send attempt (err is nil, ErrDropped, or ErrPartitioned).
+func (n *Network) SetHook(h func(kind string, from, to raft.NodeID, err error)) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.hook = h
 }
 
 // Isolate disconnects id from every other node (symmetric).
@@ -89,6 +117,35 @@ func (n *Network) Unisolate(id raft.NodeID) {
 	delete(n.isolated, id)
 }
 
+// Block drops RPCs from → to (asymmetric).
+func (n *Network) Block(from, to raft.NodeID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.blocked[from] == nil {
+		n.blocked[from] = make(map[raft.NodeID]struct{})
+	}
+	n.blocked[from][to] = struct{}{}
+}
+
+// Unblock restores from → to.
+func (n *Network) Unblock(from, to raft.NodeID) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	delete(n.blocked[from], to)
+}
+
+// ClearFaults restores reliable, fully connected delivery (does not re-register servers).
+func (n *Network) ClearFaults() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dropRate = 0
+	n.delay = 0
+	n.delayMax = 0
+	n.dupRate = 0
+	n.isolated = make(map[raft.NodeID]struct{})
+	n.blocked = make(map[raft.NodeID]map[raft.NodeID]struct{})
+}
+
 // Close waits for in-flight RPCs. Further sends fail with ErrClosed.
 func (n *Network) Close() {
 	n.mu.Lock()
@@ -103,61 +160,81 @@ type client struct {
 }
 
 func (c *client) SendRequestVote(ctx context.Context, to raft.NodeID, args *raft.RequestVoteArgs) (*raft.RequestVoteReply, error) {
-	h, err := c.net.prepare(c.from, to)
+	h, delay, dup, err := c.net.prepare("RequestVote", c.from, to)
 	if err != nil {
 		return nil, err
 	}
-	return await(ctx, &c.net.wg, c.net.delaySnapshot(), func() (*raft.RequestVoteReply, error) {
-		return h.RequestVote(ctx, args)
-	})
+	send := func() (*raft.RequestVoteReply, error) { return h.RequestVote(ctx, args) }
+	if dup {
+		go func() { _, _ = await(ctx, &c.net.wg, delay, send) }()
+	}
+	return await(ctx, &c.net.wg, delay, send)
 }
 
 func (c *client) SendAppendEntries(ctx context.Context, to raft.NodeID, args *raft.AppendEntriesArgs) (*raft.AppendEntriesReply, error) {
-	h, err := c.net.prepare(c.from, to)
+	h, delay, dup, err := c.net.prepare("AppendEntries", c.from, to)
 	if err != nil {
 		return nil, err
 	}
-	return await(ctx, &c.net.wg, c.net.delaySnapshot(), func() (*raft.AppendEntriesReply, error) {
-		return h.AppendEntries(ctx, args)
-	})
+	send := func() (*raft.AppendEntriesReply, error) { return h.AppendEntries(ctx, args) }
+	if dup {
+		go func() { _, _ = await(ctx, &c.net.wg, delay, send) }()
+	}
+	return await(ctx, &c.net.wg, delay, send)
 }
 
 func (c *client) SendInstallSnapshot(ctx context.Context, to raft.NodeID, args *raft.InstallSnapshotArgs) (*raft.InstallSnapshotReply, error) {
-	h, err := c.net.prepare(c.from, to)
+	h, delay, dup, err := c.net.prepare("InstallSnapshot", c.from, to)
 	if err != nil {
 		return nil, err
 	}
-	return await(ctx, &c.net.wg, c.net.delaySnapshot(), func() (*raft.InstallSnapshotReply, error) {
-		return h.InstallSnapshot(ctx, args)
-	})
+	send := func() (*raft.InstallSnapshotReply, error) { return h.InstallSnapshot(ctx, args) }
+	if dup {
+		go func() { _, _ = await(ctx, &c.net.wg, delay, send) }()
+	}
+	return await(ctx, &c.net.wg, delay, send)
 }
 
-func (n *Network) delaySnapshot() time.Duration {
+func (n *Network) prepare(kind string, from, to raft.NodeID) (raft.RPCHandler, time.Duration, bool, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	return n.delay
-}
-
-func (n *Network) prepare(from, to raft.NodeID) (raft.RPCHandler, error) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	hook := n.hook
+	fail := func(err error) (raft.RPCHandler, time.Duration, bool, error) {
+		if hook != nil {
+			hook(kind, from, to, err)
+		}
+		return nil, 0, false, err
+	}
 	if n.closed {
-		return nil, ErrClosed
+		return fail(ErrClosed)
 	}
 	if _, ok := n.isolated[from]; ok {
-		return nil, ErrPartitioned
+		return fail(ErrPartitioned)
 	}
 	if _, ok := n.isolated[to]; ok {
-		return nil, ErrPartitioned
+		return fail(ErrPartitioned)
+	}
+	if m := n.blocked[from]; m != nil {
+		if _, ok := m[to]; ok {
+			return fail(ErrPartitioned)
+		}
 	}
 	if n.dropRate > 0 && n.rng.Float64() < n.dropRate {
-		return nil, ErrDropped
+		return fail(ErrDropped)
 	}
 	h, ok := n.servers[to]
 	if !ok {
-		return nil, ErrUnknownPeer
+		return fail(ErrUnknownPeer)
 	}
-	return h, nil
+	delay := n.delay
+	if n.delayMax > 0 {
+		delay = time.Duration(n.rng.Int63n(int64(n.delayMax) + 1))
+	}
+	dup := n.dupRate > 0 && n.rng.Float64() < n.dupRate
+	if hook != nil {
+		hook(kind, from, to, nil)
+	}
+	return h, delay, dup, nil
 }
 
 func await[T any](ctx context.Context, wg *sync.WaitGroup, delay time.Duration, fn func() (T, error)) (T, error) {

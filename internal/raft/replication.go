@@ -166,20 +166,19 @@ func (n *Node) findLastIndexOfTermLocked(term uint64) uint64 {
 }
 
 func (n *Node) advanceCommitLocked() {
-	for index := n.lastIndex(); index > n.commitIndex; index-- {
-		term, ok := n.termAt(index)
-		if !ok || term != n.currentTerm {
-			continue
-		}
-		count := 1
-		for _, p := range n.peers {
-			if n.matchIndex[p] >= index {
-				count++
+	n.bumpCommitLocked(HighestCommittable(
+		n.lastIndex(), n.commitIndex, n.currentTerm,
+		n.termAt,
+		func(index uint64) int {
+			count := 1
+			for _, p := range n.peers {
+				if n.matchIndex[p] >= index {
+					count++
+				}
 			}
-		}
-		if count >= n.majority() {
-			n.bumpCommitLocked(index)
-			return
-		}
-	}
+			return count
+		},
+		n.majority(),
+		!SkipFigure8.Load(),
+	))
 }

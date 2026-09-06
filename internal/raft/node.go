@@ -330,56 +330,19 @@ func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*Appen
 	n.leaderID = args.LeaderID
 	n.resetElectionDeadlineLocked()
 
-	if args.PrevLogIndex > n.lastIndex() {
-		reply.ConflictIndex = n.lastIndex() + 1
+	ok, cTerm, cIndex := CheckPrevLog(n.log, args.PrevLogIndex, args.PrevLogTerm)
+	if !ok {
+		reply.ConflictTerm = cTerm
+		reply.ConflictIndex = cIndex
 		reply.Term = n.currentTerm
 		return reply, nil
 	}
-	if args.PrevLogIndex > 0 {
-		prevTerm, ok := n.termAt(args.PrevLogIndex)
-		if !ok || prevTerm != args.PrevLogTerm {
-			if ok {
-				reply.ConflictTerm = prevTerm
-				reply.ConflictIndex = n.firstIndexOfTermLocked(prevTerm)
-			} else {
-				reply.ConflictIndex = n.firstIndex()
-			}
-			reply.Term = n.currentTerm
-			return reply, nil
-		}
-	}
 
-	insertAt := args.PrevLogIndex + 1
-	for i, ent := range args.Entries {
-		idx := insertAt + uint64(i)
-		if idx <= n.lastIndex() {
-			existingTerm, _ := n.termAt(idx)
-			if existingTerm != ent.Term {
-				n.truncateLogLocked(idx)
-				toAppend := make([]LogEntry, len(args.Entries[i:]))
-				for j, e := range args.Entries[i:] {
-					toAppend[j] = LogEntry{
-						Term:    e.Term,
-						Index:   e.Index,
-						Command: append([]byte(nil), e.Command...),
-					}
-				}
-				n.appendLogLocked(toAppend)
-				break
-			}
-			continue
-		}
-		toAppend := make([]LogEntry, len(args.Entries[i:]))
-		for j, e := range args.Entries[i:] {
-			toAppend[j] = LogEntry{
-				Term:    e.Term,
-				Index:   e.Index,
-				Command: append([]byte(nil), e.Command...),
-			}
-		}
-		n.appendLogLocked(toAppend)
-		break
+	truncFrom, toAppend := PlanLogMerge(n.log, args.PrevLogIndex, args.Entries)
+	if truncFrom > 0 {
+		n.truncateLogLocked(truncFrom)
 	}
+	n.appendLogLocked(toAppend)
 
 	if args.LeaderCommit > n.commitIndex {
 		lastNew := n.lastIndex()
@@ -393,16 +356,6 @@ func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*Appen
 	reply.Success = true
 	reply.Term = n.currentTerm
 	return reply, nil
-}
-
-func (n *Node) firstIndexOfTermLocked(term uint64) uint64 {
-	for i := n.firstIndex(); i <= n.lastIndex(); i++ {
-		t, ok := n.termAt(i)
-		if ok && t == term {
-			return i
-		}
-	}
-	return n.firstIndex()
 }
 
 // InstallSnapshot handles an incoming InstallSnapshot RPC. Phase 2 applies the term rule only.

@@ -264,7 +264,7 @@ func disconnectFollowers(c *Cluster, leader raft.NodeID, n int) {
 
 func restartAll(c *Cluster) {
 	for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
-		if c.nodes[id] == nil {
+		if c.TryNode(id) == nil {
 			c.Restart(id)
 		}
 	}
@@ -322,6 +322,7 @@ func TestFigure8(t *testing.T) {
 func figure8Round(t *testing.T, seed int) {
 	t.Helper()
 	c := NewCluster(t, 5)
+	defer c.Shutdown()
 	leader := c.CheckOneLeader()
 
 	_, index, _ := c.Start(cmd(seed))

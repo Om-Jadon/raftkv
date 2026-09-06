@@ -1,4 +1,4 @@
-.PHONY: build test race lint vet cover chaos proto help
+.PHONY: build test race lint vet cover chaos chaos-soak proto help
 
 GO ?= go
 SEEDS ?= 200
@@ -6,7 +6,7 @@ PACKAGES := ./...
 PROTOC ?= protoc
 
 help:
-	@echo "Targets: build test race lint vet cover chaos proto"
+	@echo "Targets: build test race lint vet cover chaos chaos-soak proto"
 
 build:
 	$(GO) build $(PACKAGES)
@@ -36,7 +36,10 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=module=github.com/Om-Jadon/raftkv \
 		proto/raft.proto
 
-# Chaos suite lands in Phase 7; placeholder keeps the target stable.
+# SEEDS defaults to 200. Re-run a failure with: go test ./test/chaos -chaos.seed=N
 chaos:
-	@echo "chaos suite not implemented yet (Phase 7); SEEDS=$(SEEDS)"
-	$(GO) test -count=1 $(PACKAGES)
+	CHAOS_SEEDS=$(SEEDS) $(GO) test -count=1 -timeout 45m ./test/chaos -run '^TestChaosSeeds$$'
+	CHAOS_SOAK=1 $(GO) test -race -count=1 -timeout 10m ./test/chaos -run '^TestChaosSoak$$'
+
+chaos-soak:
+	CHAOS_SOAK=1 $(GO) test -race -count=1 -timeout 10m ./test/chaos -run '^TestChaosSoak$$'

@@ -2,7 +2,7 @@
 
 A distributed key-value store powered by a from-scratch [Raft](https://raft.github.io/) consensus implementation in Go.
 
-**Status:** Phase 0 scaffolding. See [PLAN.md](PLAN.md) for the full build roadmap.
+**Status:** Phase 7 — chaos harness and safety invariants.
 
 ## Module
 
@@ -17,6 +17,7 @@ make test   # unit tests
 make race   # tests with the race detector
 make vet    # go vet
 make lint   # golangci-lint (skipped with a note if not installed)
+make chaos  # 200 chaos seeds + 2-minute race soak (SEEDS=n to override)
 ```
 
 ## Roadmap
