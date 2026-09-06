@@ -2,30 +2,45 @@ package harness
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Om-Jadon/raftkv/internal/raft"
+	"github.com/Om-Jadon/raftkv/internal/storage"
 	"github.com/Om-Jadon/raftkv/internal/transport/memory"
 )
 
 // Cluster is an in-process group of Raft nodes sharing a memory network.
 type Cluster struct {
-	mu       sync.Mutex
-	t        *testing.T
-	n        int
-	net      *memory.Network
-	nodes    map[raft.NodeID]*raft.Node
-	storage  map[raft.NodeID]raft.Storage
-	sms      map[raft.NodeID]*RecordSM
-	isolated map[raft.NodeID]bool
-	seenLead map[uint64]raft.NodeID
-	shutdown bool
+	mu        sync.Mutex
+	t         *testing.T
+	n         int
+	net       *memory.Network
+	nodes     map[raft.NodeID]*raft.Node
+	storage   map[raft.NodeID]raft.Storage
+	dataDirs  map[raft.NodeID]string
+	sms       map[raft.NodeID]*RecordSM
+	isolated  map[raft.NodeID]bool
+	seenLead  map[uint64]raft.NodeID
+	shutdown  bool
+	persist   bool
+	rootDir   string
 }
 
-// NewCluster starts n Followers with IDs 1..n, fully connected.
+// NewCluster starts n Followers with IDs 1..n, fully connected (in-memory storage).
 func NewCluster(t *testing.T, n int) *Cluster {
+	return newCluster(t, n, false)
+}
+
+// NewPersistentCluster starts n Followers with file-backed storage under a temp dir.
+func NewPersistentCluster(t *testing.T, n int) *Cluster {
+	return newCluster(t, n, true)
+}
+
+func newCluster(t *testing.T, n int, persist bool) *Cluster {
 	t.Helper()
 	if n <= 0 {
 		t.Fatalf("NewCluster: n must be > 0")
@@ -36,9 +51,14 @@ func NewCluster(t *testing.T, n int) *Cluster {
 		net:      memory.New(1),
 		nodes:    make(map[raft.NodeID]*raft.Node, n),
 		storage:  make(map[raft.NodeID]raft.Storage, n),
+		dataDirs: make(map[raft.NodeID]string, n),
 		sms:      make(map[raft.NodeID]*RecordSM, n),
 		isolated: make(map[raft.NodeID]bool, n),
 		seenLead: make(map[uint64]raft.NodeID),
+		persist:  persist,
+	}
+	if persist {
+		c.rootDir = t.TempDir()
 	}
 	peers := make([]raft.NodeID, 0, n)
 	for i := 1; i <= n; i++ {
@@ -47,7 +67,7 @@ func NewCluster(t *testing.T, n int) *Cluster {
 	for i := 1; i <= n; i++ {
 		id := raft.NodeID(i)
 		cfg := raft.DefaultConfig(id, others(peers, id))
-		st := raft.NewMemoryStorage()
+		st := c.openStorage(id, &cfg)
 		sm := &RecordSM{}
 		node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
 		c.net.Register(id, node)
@@ -58,6 +78,21 @@ func NewCluster(t *testing.T, n int) *Cluster {
 	}
 	t.Cleanup(c.Shutdown)
 	return c
+}
+
+func (c *Cluster) openStorage(id raft.NodeID, cfg *raft.Config) raft.Storage {
+	c.t.Helper()
+	if !c.persist {
+		return raft.NewMemoryStorage()
+	}
+	dir := filepath.Join(c.rootDir, fmt.Sprintf("node-%d", id))
+	cfg.DataDir = dir
+	c.dataDirs[id] = dir
+	st, err := storage.Open(dir)
+	if err != nil {
+		c.t.Fatalf("open storage for %d: %v", id, err)
+	}
+	return st
 }
 
 func others(all []raft.NodeID, self raft.NodeID) []raft.NodeID {
@@ -114,9 +149,16 @@ func (c *Cluster) Crash(id raft.NodeID) {
 	c.net.Unregister(id)
 	c.isolated[id] = true
 	c.nodes[id] = nil
+	if c.persist {
+		if fs, ok := c.storage[id].(*storage.FileStorage); ok {
+			_ = fs.Close()
+		}
+		c.storage[id] = nil
+	}
 }
 
-// Restart replaces a crashed (or live) node with a fresh Node on the same storage.
+// Restart replaces a crashed (or live) node with a fresh Node on the same storage/data dir.
+// Volatile state (commitIndex, lastApplied, role) starts from zero and is rebuilt by replication.
 func (c *Cluster) Restart(id raft.NodeID) {
 	c.t.Helper()
 	if live, ok := c.nodes[id]; ok && live != nil {
@@ -136,11 +178,28 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		c.sms[id] = sm
 	}
 	sm.Reset()
-	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, c.storage[id], sm)
+	st := c.storage[id]
+	if st == nil {
+		st = c.openStorage(id, &cfg)
+		c.storage[id] = st
+	} else if c.persist {
+		cfg.DataDir = c.dataDirs[id]
+	}
+	node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
 	c.net.Register(id, node)
 	c.nodes[id] = node
 	delete(c.isolated, id)
 	node.Run()
+}
+
+// Storage returns the Storage for id (may be nil while crashed in persistent mode).
+func (c *Cluster) Storage(id raft.NodeID) raft.Storage {
+	return c.storage[id]
+}
+
+// DataDir returns the on-disk directory for a persistent node.
+func (c *Cluster) DataDir(id raft.NodeID) string {
+	return c.dataDirs[id]
 }
 
 // SendRequestVote sends a RequestVote RPC from one cluster node to another.
@@ -259,6 +318,14 @@ func (c *Cluster) Shutdown() {
 		if n != nil {
 			n.Stop()
 			c.nodes[id] = nil
+		}
+	}
+	if c.persist {
+		for id, st := range c.storage {
+			if fs, ok := st.(*storage.FileStorage); ok {
+				_ = fs.Close()
+			}
+			c.storage[id] = nil
 		}
 	}
 	c.net.Close()

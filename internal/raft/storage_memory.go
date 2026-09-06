@@ -2,7 +2,7 @@ package raft
 
 import "sync"
 
-// MemoryStorage is a volatile Storage used until Phase 4 persistence.
+// MemoryStorage is a volatile Storage used by unit tests that do not need durability.
 type MemoryStorage struct {
 	mu       sync.Mutex
 	term     uint64

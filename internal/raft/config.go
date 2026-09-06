@@ -12,6 +12,9 @@ type Config struct {
 	HeartbeatInterval  time.Duration
 	TickInterval       time.Duration
 	RandSeed           int64
+	// DataDir is the durable storage directory for this node (Phase 4+).
+	// Empty means the caller supplies an in-memory or other Storage.
+	DataDir string
 }
 
 // DefaultConfig returns lab-style timeouts: election 150–300ms, heartbeat 50ms.

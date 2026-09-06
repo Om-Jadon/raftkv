@@ -6,7 +6,9 @@ import (
 )
 
 func (n *Node) persistLocked() {
-	_ = n.storage.SaveHardState(n.currentTerm, n.votedFor)
+	if err := n.storage.SaveHardState(n.currentTerm, n.votedFor); err != nil {
+		panic(err)
+	}
 }
 
 func (n *Node) stepDownLocked(term uint64) {

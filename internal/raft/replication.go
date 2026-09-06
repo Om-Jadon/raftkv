@@ -35,7 +35,9 @@ func (n *Node) appendLogLocked(entries []LogEntry) {
 	copied := make([]LogEntry, len(entries))
 	copy(copied, entries)
 	n.log = append(n.log, copied...)
-	_ = n.storage.AppendEntries(copied)
+	if err := n.storage.AppendEntries(copied); err != nil {
+		panic(err)
+	}
 }
 
 func (n *Node) truncateLogLocked(from uint64) {
@@ -44,7 +46,9 @@ func (n *Node) truncateLogLocked(from uint64) {
 		return
 	}
 	n.log = append([]LogEntry(nil), n.log[:off]...)
-	_ = n.storage.TruncateFrom(from)
+	if err := n.storage.TruncateFrom(from); err != nil {
+		panic(err)
+	}
 }
 
 func (n *Node) replicateAll() {
