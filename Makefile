@@ -1,11 +1,12 @@
-.PHONY: build test race lint vet cover chaos help
+.PHONY: build test race lint vet cover chaos proto help
 
 GO ?= go
 SEEDS ?= 200
 PACKAGES := ./...
+PROTOC ?= protoc
 
 help:
-	@echo "Targets: build test race lint vet cover chaos"
+	@echo "Targets: build test race lint vet cover chaos proto"
 
 build:
 	$(GO) build $(PACKAGES)
@@ -29,6 +30,11 @@ lint:
 cover:
 	$(GO) test -coverprofile=coverage.out $(PACKAGES)
 	$(GO) tool cover -func=coverage.out
+
+proto:
+	$(PROTOC) --go_out=. --go_opt=module=github.com/Om-Jadon/raftkv \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/Om-Jadon/raftkv \
+		proto/raft.proto
 
 # Chaos suite lands in Phase 7; placeholder keeps the target stable.
 chaos:

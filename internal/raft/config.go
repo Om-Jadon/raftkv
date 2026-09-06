@@ -29,3 +29,13 @@ func DefaultConfig(id NodeID, peers []NodeID) Config {
 		RandSeed:           int64(id) * 1_000_003,
 	}
 }
+
+// WANConfig returns timeouts suited to a real TCP/gRPC network.
+func WANConfig(id NodeID, peers []NodeID) Config {
+	c := DefaultConfig(id, peers)
+	c.ElectionTimeoutMin = 300 * time.Millisecond
+	c.ElectionTimeoutMax = 600 * time.Millisecond
+	c.HeartbeatInterval = 100 * time.Millisecond
+	c.TickInterval = 20 * time.Millisecond
+	return c
+}

@@ -28,9 +28,10 @@ data/
 .worktrees/
 worktrees/
 
-# Tooling
-.golangci-lint-cache/
-vendor/
+# Local codegen toolchain (not committed)
+tools/
+.gopath/
+
 
 # Private working notes (roadmap, interview prep) — not for public consumption
 PLAN.md
