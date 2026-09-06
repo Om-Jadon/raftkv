@@ -32,6 +32,8 @@ type Node struct {
 	sm        StateMachine
 	applyCh   chan ApplyMsg
 	applyWake chan struct{}
+	waiters   map[uint64]waiter
+	leaderID  NodeID
 
 	rng              *rand.Rand
 	electionDeadline time.Time
@@ -85,6 +87,8 @@ func New(cfg Config, transport Transport, clock Clock, storage Storage, sm State
 		storage:    storage,
 		sm:         sm,
 		applyCh:    make(chan ApplyMsg, 64),
+		applyWake:  make(chan struct{}, 1),
+		waiters:    make(map[uint64]waiter),
 		rng:        rand.New(rand.NewSource(cfg.RandSeed)),
 		votes:      make(map[NodeID]struct{}),
 		done:       make(chan struct{}),
@@ -140,10 +144,38 @@ func (n *Node) LastApplied() uint64 {
 	return n.lastApplied
 }
 
+// LeaderID returns the last known leader, or 0 if unknown.
+func (n *Node) LeaderID() NodeID {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role == Leader {
+		return n.id
+	}
+	return n.leaderID
+}
+
+// Status returns a consistent snapshot of node metadata.
+func (n *Node) Status() Status {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	leader := n.leaderID
+	if n.role == Leader {
+		leader = n.id
+	}
+	return Status{
+		ID:          n.id,
+		Role:        n.role,
+		Term:        n.currentTerm,
+		CommitIndex: n.commitIndex,
+		LastApplied: n.lastApplied,
+		LogSize:     n.lastIndex(),
+		Leader:      leader,
+	}
+}
+
 // Run launches background goroutines. It is a no-op if already started.
 func (n *Node) Run() {
 	n.startOnce.Do(func() {
-		n.applyWake = make(chan struct{}, 1)
 		n.wg.Add(2)
 		go n.runApplier()
 		go n.runTicker()
@@ -155,6 +187,9 @@ func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		n.cancel()
 		close(n.done)
+		n.mu.Lock()
+		n.failWaitersLocked()
+		n.mu.Unlock()
 		n.wg.Wait()
 	})
 }
@@ -292,6 +327,7 @@ func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*Appen
 		return reply, nil
 	}
 	n.role = Follower
+	n.leaderID = args.LeaderID
 	n.resetElectionDeadlineLocked()
 
 	if args.PrevLogIndex > n.lastIndex() {
@@ -387,6 +423,7 @@ func (n *Node) InstallSnapshot(_ context.Context, args *InstallSnapshotArgs) (*I
 		return reply, nil
 	}
 	n.role = Follower
+	n.leaderID = args.LeaderID
 	n.resetElectionDeadlineLocked()
 	reply.Term = n.currentTerm
 	return reply, nil

@@ -28,19 +28,27 @@ type Cluster struct {
 	shutdown  bool
 	persist   bool
 	rootDir   string
+	newSM     func(raft.NodeID) raft.StateMachine
+}
+
+// ClusterOptions customizes cluster construction.
+type ClusterOptions struct {
+	Persist bool
+	NewSM   func(raft.NodeID) raft.StateMachine
 }
 
 // NewCluster starts n Followers with IDs 1..n, fully connected (in-memory storage).
 func NewCluster(t *testing.T, n int) *Cluster {
-	return newCluster(t, n, false)
+	return NewClusterWith(t, n, ClusterOptions{})
 }
 
 // NewPersistentCluster starts n Followers with file-backed storage under a temp dir.
 func NewPersistentCluster(t *testing.T, n int) *Cluster {
-	return newCluster(t, n, true)
+	return NewClusterWith(t, n, ClusterOptions{Persist: true})
 }
 
-func newCluster(t *testing.T, n int, persist bool) *Cluster {
+// NewClusterWith starts n Followers with the given options.
+func NewClusterWith(t *testing.T, n int, opts ClusterOptions) *Cluster {
 	t.Helper()
 	if n <= 0 {
 		t.Fatalf("NewCluster: n must be > 0")
@@ -55,9 +63,10 @@ func newCluster(t *testing.T, n int, persist bool) *Cluster {
 		sms:      make(map[raft.NodeID]*RecordSM, n),
 		isolated: make(map[raft.NodeID]bool, n),
 		seenLead: make(map[uint64]raft.NodeID),
-		persist:  persist,
+		persist:  opts.Persist,
+		newSM:    opts.NewSM,
 	}
-	if persist {
+	if c.persist {
 		c.rootDir = t.TempDir()
 	}
 	peers := make([]raft.NodeID, 0, n)
@@ -68,12 +77,14 @@ func newCluster(t *testing.T, n int, persist bool) *Cluster {
 		id := raft.NodeID(i)
 		cfg := raft.DefaultConfig(id, others(peers, id))
 		st := c.openStorage(id, &cfg)
-		sm := &RecordSM{}
+		sm := c.makeSM(id)
 		node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
 		c.net.Register(id, node)
 		c.nodes[id] = node
 		c.storage[id] = st
-		c.sms[id] = sm
+		if rec, ok := sm.(*RecordSM); ok {
+			c.sms[id] = rec
+		}
 		node.Run()
 	}
 	t.Cleanup(c.Shutdown)
@@ -95,6 +106,15 @@ func (c *Cluster) openStorage(id raft.NodeID, cfg *raft.Config) raft.Storage {
 	return st
 }
 
+func (c *Cluster) makeSM(id raft.NodeID) raft.StateMachine {
+	if c.newSM != nil {
+		return c.newSM(id)
+	}
+	sm := &RecordSM{}
+	c.sms[id] = sm
+	return sm
+}
+
 func others(all []raft.NodeID, self raft.NodeID) []raft.NodeID {
 	out := make([]raft.NodeID, 0, len(all)-1)
 	for _, id := range all {
@@ -111,9 +131,18 @@ func (c *Cluster) Len() int { return c.n }
 // Node returns the live node with the given ID.
 func (c *Cluster) Node(id raft.NodeID) *raft.Node {
 	c.t.Helper()
-	n, ok := c.nodes[id]
-	if !ok || n == nil {
+	n := c.TryNode(id)
+	if n == nil {
 		c.t.Fatalf("no live node %d", id)
+	}
+	return n
+}
+
+// TryNode returns the live node or nil if it is crashed.
+func (c *Cluster) TryNode(id raft.NodeID) *raft.Node {
+	n, ok := c.nodes[id]
+	if !ok {
+		return nil
 	}
 	return n
 }
@@ -172,12 +201,7 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		}
 	}
 	cfg := raft.DefaultConfig(id, peers)
-	sm := c.sms[id]
-	if sm == nil {
-		sm = &RecordSM{}
-		c.sms[id] = sm
-	}
-	sm.Reset()
+	sm := c.makeSM(id)
 	st := c.storage[id]
 	if st == nil {
 		st = c.openStorage(id, &cfg)

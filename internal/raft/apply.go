@@ -30,7 +30,8 @@ func (n *Node) applyCommitted() {
 		}
 		n.mu.Unlock()
 
-		_, _ = n.sm.Apply(entry)
+		result, err := n.sm.Apply(entry)
+		n.notifyWaiter(entry.Index, entry.Term, result, err)
 	}
 }
 

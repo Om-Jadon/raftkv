@@ -9,6 +9,9 @@ const maxAppendBatch = 500
 
 // Start appends a command on the leader and returns its log index and term.
 func (n *Node) Start(cmd []byte) (index, term uint64, isLeader bool) {
+	if n.stopped() {
+		return 0, 0, false
+	}
 	n.mu.Lock()
 	if n.role != Leader {
 		term = n.currentTerm

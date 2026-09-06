@@ -38,6 +38,26 @@ type ApplyMsg struct {
 	Index   uint64
 	Term    uint64
 	Command []byte
+	Result  any
+}
+
+// ApplyResult is returned to a Propose waiter after the entry is applied.
+type ApplyResult struct {
+	Index  uint64
+	Term   uint64
+	Result any
+	Err    error
+}
+
+// Status is a snapshot of volatile node state for /status.
+type Status struct {
+	ID          NodeID
+	Role        Role
+	Term        uint64
+	CommitIndex uint64
+	LastApplied uint64
+	LogSize     uint64
+	Leader      NodeID
 }
 
 // HardState is the persistent Raft metadata (term and vote).

@@ -17,7 +17,11 @@ func (n *Node) stepDownLocked(term uint64) {
 		n.votedFor = nil
 		n.persistLocked()
 	}
+	if n.leaderID == n.id {
+		n.leaderID = 0
+	}
 	n.role = Follower
+	n.failWaitersLocked()
 }
 
 func (n *Node) majority() int {
@@ -67,6 +71,7 @@ func (n *Node) startElectionLocked() (rv *RequestVoteArgs, rvPeers []NodeID, bec
 
 func (n *Node) becomeLeaderLocked() {
 	n.role = Leader
+	n.leaderID = n.id
 	n.lastHeartbeat = n.clock.Now()
 	for _, p := range n.peers {
 		n.nextIndex[p] = n.lastIndex() + 1
