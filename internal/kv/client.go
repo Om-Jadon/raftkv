@@ -20,6 +20,7 @@ type Client struct {
 	mu       sync.Mutex
 	addrs    []string
 	leader   string
+	skip     map[string]struct{}
 	clientID uint64
 	seq      uint64
 	http     *http.Client
@@ -31,6 +32,7 @@ func NewClient(addrs []string) *Client {
 	return &Client{
 		addrs:    cp,
 		leader:   cp[0],
+		skip:     make(map[string]struct{}),
 		clientID: newClientID(),
 		http:     &http.Client{Timeout: 3 * time.Second},
 	}
@@ -140,20 +142,16 @@ func (c *Client) do(ctx context.Context, method, path, body string) (*http.Respo
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
+			c.noteUnreachable(target)
 			c.rotate(target)
 			time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 			continue
 		}
 		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
-			if loc := resp.Header.Get(headerLeader); loc != "" {
-				c.mu.Lock()
-				c.leader = loc
-				c.mu.Unlock()
-			} else {
-				c.rotate(target)
-			}
+			loc := resp.Header.Get(headerLeader)
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
+			c.follow(loc, target)
 			lastErr = fmt.Errorf("status %d", resp.StatusCode)
 			time.Sleep(time.Duration(20*(attempt+1)) * time.Millisecond)
 			continue
@@ -166,9 +164,48 @@ func (c *Client) do(ctx context.Context, method, path, body string) (*http.Respo
 	return nil, lastErr
 }
 
+func (c *Client) noteUnreachable(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, a := range c.addrs {
+		if a == addr {
+			return
+		}
+	}
+	if addr != "" {
+		c.skip[addr] = struct{}{}
+	}
+}
+
+func (c *Client) follow(advertised, failed string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if advertised != "" {
+		if _, bad := c.skip[advertised]; !bad {
+			c.leader = advertised
+			return
+		}
+	}
+	c.rotateLocked(failed)
+}
+
 func (c *Client) rotate(failed string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.rotateLocked(failed)
+}
+
+func (c *Client) rotateLocked(failed string) {
+	for _, a := range c.addrs {
+		if a == failed {
+			continue
+		}
+		if _, bad := c.skip[a]; bad {
+			continue
+		}
+		c.leader = a
+		return
+	}
 	for _, a := range c.addrs {
 		if a != failed {
 			c.leader = a

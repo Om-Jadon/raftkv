@@ -1,0 +1,91 @@
+name: raftkv
+
+x-node: &node
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  image: raftkv:local
+  restart: "no"
+  stop_grace_period: 3s
+
+x-peers: &peers "--peers=1@node1:7000,2@node2:7000,3@node3:7000,4@node4:7000,5@node5:7000"
+x-http-peers: &http-peers "--http-peers=1@node1:8080,2@node2:8080,3@node3:8080,4@node4:8080,5@node5:8080"
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command:
+      - --id=1
+      - --data-dir=/data
+      - --raft-addr=0.0.0.0:7000
+      - --http-addr=0.0.0.0:8080
+      - *peers
+      - *http-peers
+    ports:
+      - "8081:8080"
+    volumes:
+      - n1:/data
+  node2:
+    <<: *node
+    hostname: node2
+    command:
+      - --id=2
+      - --data-dir=/data
+      - --raft-addr=0.0.0.0:7000
+      - --http-addr=0.0.0.0:8080
+      - *peers
+      - *http-peers
+    ports:
+      - "8082:8080"
+    volumes:
+      - n2:/data
+  node3:
+    <<: *node
+    hostname: node3
+    command:
+      - --id=3
+      - --data-dir=/data
+      - --raft-addr=0.0.0.0:7000
+      - --http-addr=0.0.0.0:8080
+      - *peers
+      - *http-peers
+    ports:
+      - "8083:8080"
+    volumes:
+      - n3:/data
+  node4:
+    <<: *node
+    hostname: node4
+    command:
+      - --id=4
+      - --data-dir=/data
+      - --raft-addr=0.0.0.0:7000
+      - --http-addr=0.0.0.0:8080
+      - *peers
+      - *http-peers
+    ports:
+      - "8084:8080"
+    volumes:
+      - n4:/data
+  node5:
+    <<: *node
+    hostname: node5
+    command:
+      - --id=5
+      - --data-dir=/data
+      - --raft-addr=0.0.0.0:7000
+      - --http-addr=0.0.0.0:8080
+      - *peers
+      - *http-peers
+    ports:
+      - "8085:8080"
+    volumes:
+      - n5:/data
+
+volumes:
+  n1:
+  n2:
+  n3:
+  n4:
+  n5:
