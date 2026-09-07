@@ -43,8 +43,8 @@ type Storage interface {
 	LoadSnapshot() (Snapshot, bool, error)
 }
 
-// StateMachine applies committed log entries. Snapshot/Restore are stubs until
-// the KV layer and log compaction land.
+// StateMachine applies committed log entries. Snapshot/Restore must include
+// whatever the application needs for exactly-once semantics (the KV session table).
 type StateMachine interface {
 	Apply(entry LogEntry) (result any, err error)
 	Snapshot() ([]byte, error)

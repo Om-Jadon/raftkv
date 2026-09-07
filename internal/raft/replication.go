@@ -77,27 +77,27 @@ func (n *Node) replicateTo(peer NodeID) {
 	if next < 1 {
 		next = 1
 	}
+	if n.hasSnap && next <= n.firstIndex() {
+		n.mu.Unlock()
+		n.sendSnapshot(peer)
+		return
+	}
 	prevIndex := next - 1
 	prevTerm, ok := n.termAt(prevIndex)
 	if !ok {
 		n.mu.Unlock()
+		if n.hasSnap {
+			n.sendSnapshot(peer)
+		}
 		return
 	}
 	end := n.lastIndex() + 1
 	if end > next+maxAppendBatch {
 		end = next + maxAppendBatch
 	}
-	var entries []LogEntry
-	for i := next; i < end; i++ {
-		e, ok := n.entryAt(i)
-		if !ok {
-			break
-		}
-		entries = append(entries, LogEntry{
-			Term:    e.Term,
-			Index:   e.Index,
-			Command: append([]byte(nil), e.Command...),
-		})
+	entries := n.sliceFrom(next)
+	if uint64(len(entries)) > end-next {
+		entries = entries[:end-next]
 	}
 	args := AppendEntriesArgs{
 		Term:         n.currentTerm,

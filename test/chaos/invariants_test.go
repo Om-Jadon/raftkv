@@ -37,8 +37,20 @@ func TestCheckerLeaderCompleteness(t *testing.T) {
 		t.Fatal(err)
 	}
 	leader := []raft.LogEntry{{Index: 0}, {Index: 1, Term: 2, Command: []byte("B")}}
-	if err := chk.leaderCompleteness([]raft.DebugState{{ID: 2, Role: raft.Leader, Log: leader}}); err == nil {
+	if err := chk.leaderCompleteness([]raft.DebugState{{ID: 2, Role: raft.Leader, Term: 3, Log: leader}}); err == nil {
 		t.Fatal("expected leader completeness violation")
+	}
+}
+
+func TestCheckerStaleLeaderIgnoresNewerCommits(t *testing.T) {
+	chk := newChecker()
+	newer := []raft.LogEntry{{Index: 0}, {Index: 1, Term: 4, Command: []byte("A")}}
+	if err := chk.observeCommits([]raft.DebugState{{ID: 1, CommitIndex: 1, Log: newer}}); err != nil {
+		t.Fatal(err)
+	}
+	stale := []raft.LogEntry{{Index: 0}}
+	if err := chk.leaderCompleteness([]raft.DebugState{{ID: 5, Role: raft.Leader, Term: 3, Log: stale}}); err != nil {
+		t.Fatalf("partitioned old leader should not be required to hold newer commits: %v", err)
 	}
 }
 
@@ -76,6 +88,25 @@ func TestCheckerLeaderAppendOnly(t *testing.T) {
 	shrunk := []raft.LogEntry{{Index: 0}}
 	if err := chk.leaderAppendOnly([]raft.DebugState{{ID: 1, Role: raft.Leader, Term: 4, Log: shrunk}}); err == nil {
 		t.Fatal("expected append-only violation")
+	}
+}
+
+func TestCheckerLeaderAppendOnlyCompaction(t *testing.T) {
+	chk := newChecker()
+	full := []raft.LogEntry{
+		{Index: 0},
+		{Index: 1, Term: 4, Command: []byte("a")},
+		{Index: 2, Term: 4, Command: []byte("b")},
+	}
+	if err := chk.leaderAppendOnly([]raft.DebugState{{ID: 1, Role: raft.Leader, Term: 4, Log: full}}); err != nil {
+		t.Fatal(err)
+	}
+	compacted := []raft.LogEntry{
+		{Index: 1, Term: 4, Command: []byte("a")},
+		{Index: 2, Term: 4, Command: []byte("b")},
+	}
+	if err := chk.leaderAppendOnly([]raft.DebugState{{ID: 1, Role: raft.Leader, Term: 4, Log: compacted}}); err != nil {
+		t.Fatalf("prefix compaction is not an append-only violation: %v", err)
 	}
 }
 

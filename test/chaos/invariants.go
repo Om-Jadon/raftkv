@@ -67,22 +67,65 @@ func (c *checker) electionSafety(states []raft.DebugState) error {
 
 func (c *checker) observeCommits(states []raft.DebugState) error {
 	for _, s := range states {
+		if len(s.Log) == 0 {
+			continue
+		}
+		first := s.Log[0].Index
 		for i := uint64(1); i <= s.CommitIndex; i++ {
 			e, ok := entryAt(s.Log, i)
 			if !ok {
 				continue
 			}
 			if old, exists := c.committed[i]; exists {
-				if old.Term != e.Term || !bytes.Equal(old.Command, e.Command) {
+				if old.Term != e.Term {
 					return fmt.Errorf("durability: index %d committed as term=%d %q then term=%d %q (node %d)",
 						i, old.Term, old.Command, e.Term, e.Command, s.ID)
 				}
+				if i != first && len(old.Command) > 0 && len(e.Command) > 0 && !bytes.Equal(old.Command, e.Command) {
+					return fmt.Errorf("durability: index %d committed as term=%d %q then term=%d %q (node %d)",
+						i, old.Term, old.Command, e.Term, e.Command, s.ID)
+				}
+				if i != first && len(old.Command) == 0 && len(e.Command) > 0 {
+					c.committed[i] = raft.LogEntry{Term: e.Term, Index: e.Index, Command: append([]byte(nil), e.Command...)}
+				}
 				continue
 			}
-			c.committed[i] = raft.LogEntry{Term: e.Term, Index: e.Index, Command: append([]byte(nil), e.Command...)}
+			cmd := append([]byte(nil), e.Command...)
+			if i == first {
+				cmd = nil
+			}
+			c.committed[i] = raft.LogEntry{Term: e.Term, Index: e.Index, Command: cmd}
 		}
 	}
 	return nil
+}
+
+func (c *checker) covered(s raft.DebugState, i uint64, e raft.LogEntry) bool {
+	if len(s.Log) == 0 {
+		return false
+	}
+	first := s.Log[0].Index
+	if i < first {
+		return true
+	}
+	got, ok := entryAt(s.Log, i)
+	if !ok {
+		return false
+	}
+	if got.Term != e.Term {
+		return false
+	}
+	if i == first || len(e.Command) == 0 || len(got.Command) == 0 {
+		return true
+	}
+	return bytes.Equal(got.Command, e.Command)
+}
+
+func lastIdx(log []raft.LogEntry) uint64 {
+	if len(log) == 0 {
+		return 0
+	}
+	return log[len(log)-1].Index
 }
 
 func (c *checker) leaderAppendOnly(states []raft.DebugState) error {
@@ -92,13 +135,30 @@ func (c *checker) leaderAppendOnly(states []raft.DebugState) error {
 		}
 		prev, ok := c.leaderSnap[s.ID]
 		if ok && prev.term == s.Term {
-			if len(s.Log) < len(prev.log) {
-				return fmt.Errorf("leader append-only: node %d term %d log shrank %d -> %d", s.ID, s.Term, len(prev.log), len(s.Log))
+			if lastIdx(s.Log) < lastIdx(prev.log) {
+				return fmt.Errorf("leader append-only: node %d term %d last index shrank %d -> %d",
+					s.ID, s.Term, lastIdx(prev.log), lastIdx(s.Log))
 			}
-			for i := range prev.log {
-				if prev.log[i].Term != s.Log[i].Term || prev.log[i].Index != s.Log[i].Index ||
-					!bytes.Equal(prev.log[i].Command, s.Log[i].Command) {
-					return fmt.Errorf("leader append-only: node %d overwrote index %d in term %d", s.ID, prev.log[i].Index, s.Term)
+			prevFirst, newFirst := uint64(0), uint64(0)
+			if len(prev.log) > 0 {
+				prevFirst = prev.log[0].Index
+			}
+			if len(s.Log) > 0 {
+				newFirst = s.Log[0].Index
+			}
+			for _, e := range s.Log {
+				pe, ok := entryAt(prev.log, e.Index)
+				if !ok {
+					continue
+				}
+				if pe.Term != e.Term || pe.Index != e.Index {
+					return fmt.Errorf("leader append-only: node %d overwrote index %d in term %d", s.ID, e.Index, s.Term)
+				}
+				if e.Index == prevFirst || e.Index == newFirst {
+					continue
+				}
+				if !bytes.Equal(pe.Command, e.Command) {
+					return fmt.Errorf("leader append-only: node %d overwrote index %d in term %d", s.ID, e.Index, s.Term)
 				}
 			}
 		}
@@ -126,8 +186,12 @@ func (c *checker) leaderCompleteness(states []raft.DebugState) error {
 			continue
 		}
 		for i, e := range c.committed {
-			got, ok := entryAt(s.Log, i)
-			if !ok || got.Term != e.Term || !bytes.Equal(got.Command, e.Command) {
+			// Paper: committed in term T ⇒ present on leaders of terms > T.
+			// A partitioned old leader must not be required to have newer commits.
+			if e.Term >= s.Term {
+				continue
+			}
+			if !c.covered(s, i, e) {
 				return fmt.Errorf("leader completeness: leader %d missing committed index %d", s.ID, i)
 			}
 		}
@@ -139,9 +203,13 @@ func (c *checker) stateMachineSafety(states []raft.DebugState) error {
 	applied := make(map[uint64][]byte)
 	from := make(map[uint64]raft.NodeID)
 	for _, s := range states {
+		if len(s.Log) == 0 {
+			continue
+		}
+		first := s.Log[0].Index
 		for i := uint64(1); i <= s.LastApplied; i++ {
 			e, ok := entryAt(s.Log, i)
-			if !ok {
+			if !ok || i == first {
 				continue
 			}
 			if old, exists := applied[i]; exists && !bytes.Equal(old, e.Command) {
@@ -158,8 +226,7 @@ func (c *checker) stateMachineSafety(states []raft.DebugState) error {
 func (c *checker) durabilityEverywhere(states []raft.DebugState) error {
 	for _, s := range states {
 		for i, e := range c.committed {
-			got, ok := entryAt(s.Log, i)
-			if !ok || got.Term != e.Term || !bytes.Equal(got.Command, e.Command) {
+			if !c.covered(s, i, e) {
 				return fmt.Errorf("durability: node %d missing committed index %d after heal", s.ID, i)
 			}
 		}

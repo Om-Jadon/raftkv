@@ -33,7 +33,7 @@ type AppendEntriesReply struct {
 }
 
 // InstallSnapshotArgs is Figure 13 InstallSnapshot RPC arguments.
-// Phase 1 defines the type; the handler is a stub until Phase 8.
+// Snapshots are sent whole (Done is always true) up to MaxSnapshotBytes.
 type InstallSnapshotArgs struct {
 	Term              uint64
 	LeaderID          NodeID

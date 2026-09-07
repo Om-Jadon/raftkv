@@ -129,6 +129,49 @@ func TestTornWriteTolerated(t *testing.T) {
 	}
 }
 
+func TestSaveSnapshotCompactsLog(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.AppendEntries([]raft.LogEntry{
+		{Term: 1, Index: 1, Command: []byte("a")},
+		{Term: 1, Index: 2, Command: []byte("b")},
+		{Term: 2, Index: 3, Command: []byte("c")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveSnapshot(raft.Snapshot{
+		LastIncludedIndex: 2,
+		LastIncludedTerm:  1,
+		Data:              []byte("snap"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, loaded, err := s.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range loaded {
+		if e.Index > 0 && e.Index <= 2 {
+			t.Fatalf("compact should drop index %d: %v", e.Index, loaded)
+		}
+	}
+	if len(loaded) < 2 || loaded[len(loaded)-1].Index != 3 {
+		t.Fatalf("want tail index 3, got %v", loaded)
+	}
+	snap, ok, err := s.LoadSnapshot()
+	if err != nil || !ok {
+		t.Fatalf("snapshot: ok=%v err=%v", ok, err)
+	}
+	if snap.LastIncludedIndex != 2 || string(snap.Data) != "snap" {
+		t.Fatalf("snapshot = %+v", snap)
+	}
+}
+
 func TestReopenPreservesState(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

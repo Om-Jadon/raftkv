@@ -15,20 +15,21 @@ import (
 
 // Cluster is an in-process group of Raft nodes sharing a memory network.
 type Cluster struct {
-	mu       sync.Mutex
-	t        *testing.T
-	n        int
-	net      *memory.Network
-	nodes    map[raft.NodeID]*raft.Node
-	storage  map[raft.NodeID]raft.Storage
-	dataDirs map[raft.NodeID]string
-	sms      map[raft.NodeID]*RecordSM
-	isolated map[raft.NodeID]bool
-	seenLead map[uint64]raft.NodeID
-	shutdown bool
-	persist  bool
-	rootDir  string
-	newSM    func(raft.NodeID) raft.StateMachine
+	mu        sync.Mutex
+	t         *testing.T
+	n         int
+	net       *memory.Network
+	nodes     map[raft.NodeID]*raft.Node
+	storage   map[raft.NodeID]raft.Storage
+	dataDirs  map[raft.NodeID]string
+	sms       map[raft.NodeID]*RecordSM
+	isolated  map[raft.NodeID]bool
+	seenLead  map[uint64]raft.NodeID
+	shutdown  bool
+	persist   bool
+	rootDir   string
+	newSM     func(raft.NodeID) raft.StateMachine
+	snapBytes uint64
 }
 
 // ClusterOptions customizes cluster construction.
@@ -37,6 +38,8 @@ type ClusterOptions struct {
 	NewSM   func(raft.NodeID) raft.StateMachine
 	// Seed drives the fake network's drop/delay/dup RNG. Zero means 1.
 	Seed int64
+	// SnapshotThresholdBytes is copied into each node's Config. Zero disables snapshots.
+	SnapshotThresholdBytes uint64
 }
 
 // NewCluster starts n Followers with IDs 1..n, fully connected (in-memory storage).
@@ -60,17 +63,18 @@ func NewClusterWith(t *testing.T, n int, opts ClusterOptions) *Cluster {
 		netSeed = 1
 	}
 	c := &Cluster{
-		t:        t,
-		n:        n,
-		net:      memory.New(netSeed),
-		nodes:    make(map[raft.NodeID]*raft.Node, n),
-		storage:  make(map[raft.NodeID]raft.Storage, n),
-		dataDirs: make(map[raft.NodeID]string, n),
-		sms:      make(map[raft.NodeID]*RecordSM, n),
-		isolated: make(map[raft.NodeID]bool, n),
-		seenLead: make(map[uint64]raft.NodeID),
-		persist:  opts.Persist,
-		newSM:    opts.NewSM,
+		t:         t,
+		n:         n,
+		net:       memory.New(netSeed),
+		nodes:     make(map[raft.NodeID]*raft.Node, n),
+		storage:   make(map[raft.NodeID]raft.Storage, n),
+		dataDirs:  make(map[raft.NodeID]string, n),
+		sms:       make(map[raft.NodeID]*RecordSM, n),
+		isolated:  make(map[raft.NodeID]bool, n),
+		seenLead:  make(map[uint64]raft.NodeID),
+		persist:   opts.Persist,
+		newSM:     opts.NewSM,
+		snapBytes: opts.SnapshotThresholdBytes,
 	}
 	if c.persist {
 		c.rootDir = t.TempDir()
@@ -82,6 +86,7 @@ func NewClusterWith(t *testing.T, n int, opts ClusterOptions) *Cluster {
 	for i := 1; i <= n; i++ {
 		id := raft.NodeID(i)
 		cfg := raft.DefaultConfig(id, others(peers, id))
+		cfg.SnapshotThresholdBytes = opts.SnapshotThresholdBytes
 		st := c.openStorage(id, &cfg)
 		sm := c.makeSM(id)
 		node := raft.New(cfg, c.net.Transport(id), raft.RealClock{}, st, sm)
@@ -221,6 +226,7 @@ func (c *Cluster) Restart(id raft.NodeID) {
 		}
 	}
 	cfg := raft.DefaultConfig(id, peers)
+	cfg.SnapshotThresholdBytes = c.snapBytes
 
 	c.mu.Lock()
 	sm := c.makeSM(id)

@@ -14,7 +14,10 @@ func CheckPrevLog(log []LogEntry, prevIndex, prevTerm uint64) (ok bool, conflict
 		return false, 0, last + 1
 	}
 	if prevIndex == 0 {
-		return true, 0, 0
+		if first == 0 {
+			return true, 0, 0
+		}
+		return false, 0, first
 	}
 	var term uint64
 	found := false
@@ -70,22 +73,44 @@ func LogsMatch(a, b []LogEntry) bool {
 		return m
 	}
 	ma, mb := byIndex(a), byIndex(b)
+	start := firstIndexOf(a)
+	if fb := firstIndexOf(b); fb > start {
+		start = fb
+	}
 	var shared []uint64
 	for i, ea := range ma {
+		if i < start {
+			continue
+		}
 		if eb, ok := mb[i]; ok && ea.Term == eb.Term {
 			shared = append(shared, i)
 		}
 	}
+	firstA, firstB := firstIndexOf(a), firstIndexOf(b)
 	for _, i := range shared {
-		for j := uint64(0); j <= i; j++ {
+		for j := start; j <= i; j++ {
 			ea, oka := ma[j]
 			eb, okb := mb[j]
-			if !oka || !okb || ea.Term != eb.Term || !bytes.Equal(ea.Command, eb.Command) {
+			if !oka || !okb || ea.Term != eb.Term {
+				return false
+			}
+			// log[0] is the snapshot sentinel: compare term only.
+			if j == firstA || j == firstB {
+				continue
+			}
+			if !bytes.Equal(ea.Command, eb.Command) {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func firstIndexOf(log []LogEntry) uint64 {
+	if len(log) == 0 {
+		return 0
+	}
+	return log[0].Index
 }
 
 // PlanLogMerge is the Figure 2 conflict-resolution step: after prevLog matches,

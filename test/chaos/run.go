@@ -73,8 +73,9 @@ func runSeed(t *testing.T, seed int64, cfg config) error {
 		prev:  make(map[raft.NodeID]raft.DebugState),
 	}
 	c := harness.NewClusterWith(t, cfg.nodes, harness.ClusterOptions{
-		Persist: cfg.persist,
-		Seed:    seed,
+		Persist:                cfg.persist,
+		Seed:                   seed,
+		SnapshotThresholdBytes: 1024,
 		NewSM: func(id raft.NodeID) raft.StateMachine {
 			store := kv.New()
 			s.kvsMu.Lock()

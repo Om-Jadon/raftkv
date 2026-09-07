@@ -188,12 +188,38 @@ func (s *FileStorage) readLogLocked() ([]raft.LogEntry, error) {
 	return entries, nil
 }
 
-// SaveSnapshot implements raft.Storage (stub file until Phase 8).
+// SaveSnapshot persists the snapshot, then drops log entries at or below
+// LastIncludedIndex. The snapshot must be durable before the log is truncated.
 func (s *FileStorage) SaveSnapshot(snap raft.Snapshot) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	buf := encodeSnapshot(snap)
-	return atomicWrite(s.dir, snapName, buf)
+	if err := atomicWrite(s.dir, snapName, buf); err != nil {
+		return err
+	}
+	return s.compactLogLocked(snap.LastIncludedIndex)
+}
+
+func (s *FileStorage) compactLogLocked(lastIncluded uint64) error {
+	if lastIncluded == 0 {
+		return nil
+	}
+	entries, err := s.readLogLocked()
+	if err != nil {
+		return err
+	}
+	var buf []byte
+	for _, e := range entries {
+		if e.Index <= lastIncluded || e.Index == 0 {
+			continue
+		}
+		buf = append(buf, encodeRecord(e)...)
+	}
+	if err := atomicWrite(s.dir, logName, buf); err != nil {
+		return err
+	}
+	_ = s.logF.Close()
+	return s.openLog()
 }
 
 // LoadSnapshot implements raft.Storage.

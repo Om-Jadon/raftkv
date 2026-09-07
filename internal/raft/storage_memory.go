@@ -76,6 +76,16 @@ func (s *MemoryStorage) SaveSnapshot(snap Snapshot) error {
 	defer s.mu.Unlock()
 	s.snap = snap
 	s.hasSnap = true
+	if snap.LastIncludedIndex == 0 {
+		return nil
+	}
+	kept := []LogEntry{{Term: snap.LastIncludedTerm, Index: snap.LastIncludedIndex}}
+	for _, e := range s.log {
+		if e.Index > snap.LastIncludedIndex {
+			kept = append(kept, e)
+		}
+	}
+	s.log = kept
 	return nil
 }
 

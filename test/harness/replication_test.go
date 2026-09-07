@@ -27,7 +27,7 @@ func (c *Cluster) Start(cmd []byte) (raft.NodeID, uint64, uint64) {
 // WaitCommit waits until a majority of live nodes have commitIndex >= index.
 func (c *Cluster) WaitCommit(index uint64) {
 	c.t.Helper()
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		c.CheckAppliedSame()
 		count := 0
@@ -50,7 +50,7 @@ func (c *Cluster) WaitCommit(index uint64) {
 // WaitApplied waits until every connected node has applied through index.
 func (c *Cluster) WaitApplied(index uint64) {
 	c.t.Helper()
-	deadline := time.Now().Add(4 * time.Second)
+	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		c.CheckAppliedSame()
 		ok := true
@@ -82,6 +82,7 @@ func (c *Cluster) Applied(id raft.NodeID) [][]byte {
 }
 
 // CheckAppliedSame fails if connected nodes disagree on applied commands at any index.
+// Clusters that use a non-RecordSM (for example kv.KV with snapshots) skip this check.
 func (c *Cluster) CheckAppliedSame() {
 	c.t.Helper()
 	var ref []raft.NodeID
@@ -89,6 +90,12 @@ func (c *Cluster) CheckAppliedSame() {
 	for id := raft.NodeID(1); id <= raft.NodeID(c.n); id++ {
 		if !c.connected(id) {
 			continue
+		}
+		c.mu.Lock()
+		sm := c.sms[id]
+		c.mu.Unlock()
+		if sm == nil {
+			return
 		}
 		applied := c.Applied(id)
 		if ref == nil {

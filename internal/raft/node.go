@@ -17,7 +17,7 @@ type Node struct {
 
 	currentTerm uint64
 	votedFor    *NodeID
-	log         []LogEntry // log[0] is the sentinel {Term:0, Index:0}
+	log         []LogEntry // log[0] is the sentinel, or the last-included snapshot entry
 
 	role        Role
 	commitIndex uint64
@@ -34,6 +34,10 @@ type Node struct {
 	applyWake chan struct{}
 	waiters   map[uint64]waiter
 	leaderID  NodeID
+
+	snap    Snapshot
+	hasSnap bool
+	snapMu  sync.Mutex // serializes Apply / Snapshot / Restore
 
 	rng              *rand.Rand
 	electionDeadline time.Time
@@ -102,8 +106,27 @@ func New(cfg Config, transport Transport, clock Clock, storage Storage, sm State
 			n.log = entries
 		}
 	}
+	if snap, ok, err := storage.LoadSnapshot(); err == nil && ok && snap.LastIncludedIndex > 0 {
+		n.installRecoveredSnapshot(snap, n.log)
+	}
 	n.resetElectionDeadlineLocked()
 	return n
+}
+
+func (n *Node) installRecoveredSnapshot(snap Snapshot, entries []LogEntry) {
+	n.snap = snap
+	n.hasSnap = true
+	n.log = []LogEntry{{Term: snap.LastIncludedTerm, Index: snap.LastIncludedIndex}}
+	for _, e := range entries {
+		if e.Index > snap.LastIncludedIndex {
+			n.log = append(n.log, e)
+		}
+	}
+	n.lastApplied = snap.LastIncludedIndex
+	n.commitIndex = snap.LastIncludedIndex
+	if err := n.sm.Restore(append([]byte(nil), snap.Data...)); err != nil {
+		panic(err)
+	}
 }
 
 // ID returns this node's identifier.
@@ -168,7 +191,7 @@ func (n *Node) Status() Status {
 		Term:        n.currentTerm,
 		CommitIndex: n.commitIndex,
 		LastApplied: n.lastApplied,
-		LogSize:     n.lastIndex(),
+		LogSize:     uint64(len(n.log) - 1),
 		Leader:      leader,
 	}
 }
@@ -258,11 +281,11 @@ func (n *Node) lastIndex() uint64 {
 }
 
 func (n *Node) termAt(index uint64) (uint64, bool) {
-	off := int(index - n.log[0].Index)
-	if off < 0 || off >= len(n.log) {
+	e, ok := n.entryAt(index)
+	if !ok {
 		return 0, false
 	}
-	return n.log[off].Term, true
+	return e.Term, true
 }
 
 func (n *Node) entryAt(index uint64) (LogEntry, bool) {
@@ -273,11 +296,69 @@ func (n *Node) entryAt(index uint64) (LogEntry, bool) {
 	return n.log[off], true
 }
 
+func (n *Node) sliceFrom(index uint64) []LogEntry {
+	off := int(index - n.log[0].Index)
+	if off < 0 || off >= len(n.log) {
+		return nil
+	}
+	out := make([]LogEntry, len(n.log)-off)
+	for i, e := range n.log[off:] {
+		out[i] = LogEntry{
+			Term:    e.Term,
+			Index:   e.Index,
+			Command: append([]byte(nil), e.Command...),
+		}
+	}
+	return out
+}
+
+func (n *Node) logBytesLocked() uint64 {
+	var nBytes uint64
+	for i := 1; i < len(n.log); i++ {
+		nBytes += 24 + uint64(len(n.log[i].Command))
+	}
+	return nBytes
+}
+
+func (n *Node) replacePrefixLocked(lastIncluded uint64, lastTerm uint64) {
+	sentinel := LogEntry{Term: lastTerm, Index: lastIncluded}
+	if e, ok := n.entryAt(lastIncluded); ok {
+		sentinel.Command = append([]byte(nil), e.Command...)
+	}
+	var tail []LogEntry
+	for i := 1; i < len(n.log); i++ {
+		if n.log[i].Index > lastIncluded {
+			tail = append(tail, n.log[i])
+		}
+	}
+	n.log = append([]LogEntry{sentinel}, tail...)
+}
+
+// LogLen is the number of retained entries after the sentinel/snapshot base.
+func (n *Node) LogLen() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.log) == 0 {
+		return 0
+	}
+	return len(n.log) - 1
+}
+
+// StateMachine returns the applied state machine (test helper).
+func (n *Node) StateMachine() StateMachine { return n.sm }
+
 // RequestVoteCount is a Phase 1 test hook: how many RequestVote RPCs this node handled.
 func (n *Node) RequestVoteCount() int {
 	n.rpcMu.Lock()
 	defer n.rpcMu.Unlock()
 	return n.requestVotes
+}
+
+// InstallSnapshotCount is how many InstallSnapshot RPCs this node handled.
+func (n *Node) InstallSnapshotCount() int {
+	n.rpcMu.Lock()
+	defer n.rpcMu.Unlock()
+	return n.installSnaps
 }
 
 // RequestVote handles an incoming RequestVote RPC.
@@ -354,30 +435,6 @@ func (n *Node) AppendEntries(_ context.Context, args *AppendEntriesArgs) (*Appen
 	}
 
 	reply.Success = true
-	reply.Term = n.currentTerm
-	return reply, nil
-}
-
-// InstallSnapshot handles an incoming InstallSnapshot RPC. Phase 2 applies the term rule only.
-func (n *Node) InstallSnapshot(_ context.Context, args *InstallSnapshotArgs) (*InstallSnapshotReply, error) {
-	n.rpcMu.Lock()
-	n.installSnaps++
-	n.rpcMu.Unlock()
-
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	reply := &InstallSnapshotReply{Term: n.currentTerm}
-	if args.Term > n.currentTerm {
-		n.stepDownLocked(args.Term)
-		reply.Term = n.currentTerm
-	}
-	if args.Term < n.currentTerm {
-		return reply, nil
-	}
-	n.role = Follower
-	n.leaderID = args.LeaderID
-	n.resetElectionDeadlineLocked()
 	reply.Term = n.currentTerm
 	return reply, nil
 }

@@ -27,6 +27,7 @@ func main() {
 	httpAddr := flag.String("http-addr", "", "HTTP listen address")
 	httpPeers := flag.String("http-peers", "", "comma-separated id@host:httpPort (include self)")
 	dataDir := flag.String("data-dir", "", "durable storage directory")
+	snapBytes := flag.Uint64("snapshot-bytes", 64<<10, "compact the Raft log when it exceeds this many bytes (0 disables)")
 	flag.Parse()
 
 	if *dataDir == "" {
@@ -72,6 +73,7 @@ func main() {
 	store := kv.New()
 	cfg := raft.WANConfig(self, peerIDs)
 	cfg.DataDir = *dataDir
+	cfg.SnapshotThresholdBytes = *snapBytes
 	node := raft.New(cfg, tr, raft.RealClock{}, st, store)
 	tr.SetHandler(node)
 	node.Run()

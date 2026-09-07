@@ -34,6 +34,22 @@ func TestCheckPrevLog(t *testing.T) {
 	if cIndex != 4 {
 		t.Fatalf("conflict index = %d, want last+1=4", cIndex)
 	}
+
+	compacted := []LogEntry{
+		{Term: 3, Index: 5},
+		{Term: 3, Index: 6, Command: []byte("d")},
+	}
+	ok, _, cIndex = CheckPrevLog(compacted, 0, 0)
+	if ok {
+		t.Fatal("prevIndex 0 must fail once the log base is a snapshot sentinel")
+	}
+	if cIndex != 5 {
+		t.Fatalf("conflict index = %d, want first=5", cIndex)
+	}
+	ok, _, _ = CheckPrevLog(compacted, 5, 3)
+	if !ok {
+		t.Fatal("prev at the snapshot sentinel should match")
+	}
 }
 
 func TestHighestCommittableFigure8(t *testing.T) {
@@ -95,5 +111,11 @@ func TestLogsMatch(t *testing.T) {
 	b = append(b, LogEntry{Index: 2, Term: 2, Command: []byte("nope")})
 	if LogsMatch(a, b) {
 		t.Fatal("same index+term with different command must not match")
+	}
+
+	sentA := []LogEntry{{Index: 5, Term: 2}, {Index: 6, Term: 2, Command: []byte("x")}}
+	sentB := []LogEntry{{Index: 5, Term: 2, Command: []byte("full")}, {Index: 6, Term: 2, Command: []byte("x")}}
+	if !LogsMatch(sentA, sentB) {
+		t.Fatal("snapshot sentinels should match on term even if Command is empty")
 	}
 }

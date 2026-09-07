@@ -15,6 +15,9 @@ type Config struct {
 	// DataDir is the durable storage directory for this node (Phase 4+).
 	// Empty means the caller supplies an in-memory or other Storage.
 	DataDir string
+	// SnapshotThresholdBytes triggers log compaction after apply when the
+	// in-memory log exceeds this size. Zero disables snapshots.
+	SnapshotThresholdBytes uint64
 }
 
 // DefaultConfig returns lab-style timeouts: election 150–300ms, heartbeat 50ms.

@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bytes"
+	"encoding/json"
 	"sync"
 
 	"github.com/Om-Jadon/raftkv/internal/raft"
@@ -23,10 +24,21 @@ func (s *RecordSM) Apply(entry raft.LogEntry) (any, error) {
 }
 
 // Snapshot implements raft.StateMachine.
-func (s *RecordSM) Snapshot() ([]byte, error) { return nil, nil }
+func (s *RecordSM) Snapshot() ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Marshal(s.applied)
+}
 
 // Restore implements raft.StateMachine.
-func (s *RecordSM) Restore([]byte) error { return nil }
+func (s *RecordSM) Restore(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Unmarshal(data, &s.applied)
+}
 
 // Reset clears recorded commands. Call when a node restarts so replayed applies rebuild state.
 func (s *RecordSM) Reset() {
@@ -34,6 +46,7 @@ func (s *RecordSM) Reset() {
 	defer s.mu.Unlock()
 	s.applied = nil
 }
+
 // Applied returns a copy of applied commands.
 func (s *RecordSM) Applied() [][]byte {
 	s.mu.Lock()

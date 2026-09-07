@@ -67,6 +67,8 @@ type HardState struct {
 }
 
 // Snapshot is a compacted prefix of the log plus state-machine bytes.
+// The last-included entry is retained as log[0] so prevLogIndex checks
+// still address a real log slot.
 type Snapshot struct {
 	LastIncludedIndex uint64
 	LastIncludedTerm  uint64
