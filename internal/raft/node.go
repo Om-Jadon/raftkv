@@ -55,6 +55,10 @@ type Node struct {
 	stopOnce  sync.Once
 	done      chan struct{}
 	wg        sync.WaitGroup
+
+	replicateMu      sync.Mutex
+	replicateRunning bool
+	replicateAgain   bool
 }
 
 // New constructs a Follower with a sentinel log entry at index 0.
@@ -241,7 +245,7 @@ func (n *Node) onTick() {
 		}
 		n.mu.Unlock()
 		if due {
-			n.replicateAll()
+			n.triggerReplication()
 		}
 		return
 	default:
@@ -255,7 +259,7 @@ func (n *Node) onTick() {
 			n.broadcastRequestVotes(*rv, rvPeers)
 		}
 		if becameLeader {
-			n.replicateAll()
+			n.triggerReplication()
 		}
 	}
 }

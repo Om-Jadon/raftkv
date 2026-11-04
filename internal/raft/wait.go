@@ -43,7 +43,7 @@ func (n *Node) Propose(cmd []byte) (index, term uint64, wait <-chan ApplyResult,
 	ch := make(chan ApplyResult, 1)
 	n.waiters[index] = waiter{term: term, ch: ch}
 	n.mu.Unlock()
-	go n.replicateAll()
+	n.triggerReplication()
 	return index, term, ch, true
 }
 

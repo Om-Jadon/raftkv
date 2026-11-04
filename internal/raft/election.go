@@ -121,6 +121,6 @@ func (n *Node) handleRequestVoteReply(from NodeID, sentTerm uint64, reply *Reque
 	}
 	n.mu.Unlock()
 	if becameLeader {
-		n.replicateAll()
+		n.triggerReplication()
 	}
 }

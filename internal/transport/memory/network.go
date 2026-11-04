@@ -251,19 +251,25 @@ func await[T any](ctx context.Context, wg *sync.WaitGroup, delay time.Duration, 
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				ch <- struct {
+				select {
+				case ch <- struct {
 					v   T
 					err error
-				}{zero, ctx.Err()}
+				}{zero, ctx.Err()}:
+				default:
+				}
 				return
 			case <-timer.C:
 			}
 		}
 		v, err := fn()
-		ch <- struct {
+		select {
+		case ch <- struct {
 			v   T
 			err error
-		}{v, err}
+		}{v, err}:
+		default:
+		}
 	}()
 	select {
 	case <-ctx.Done():

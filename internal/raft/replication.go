@@ -27,8 +27,36 @@ func (n *Node) Start(cmd []byte) (index, term uint64, isLeader bool) {
 	}
 	n.appendLogLocked([]LogEntry{entry})
 	n.mu.Unlock()
-	go n.replicateAll()
+	n.triggerReplication()
 	return index, term, true
+}
+
+func (n *Node) triggerReplication() {
+	n.replicateMu.Lock()
+	if n.replicateRunning {
+		n.replicateAgain = true
+		n.replicateMu.Unlock()
+		return
+	}
+	n.replicateRunning = true
+	n.wg.Add(1)
+	n.replicateMu.Unlock()
+
+	go func() {
+		defer n.wg.Done()
+		for {
+			n.replicateAll()
+
+			n.replicateMu.Lock()
+			if !n.replicateAgain {
+				n.replicateRunning = false
+				n.replicateMu.Unlock()
+				return
+			}
+			n.replicateAgain = false
+			n.replicateMu.Unlock()
+		}
+	}()
 }
 
 func (n *Node) appendLogLocked(entries []LogEntry) {
